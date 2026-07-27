@@ -83,6 +83,7 @@ void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& in
   bool predicate_written_scalar = false;
   spv::Id scalar_result = ProcessScalarAluOperation(instr, memexport_eM_potentially_written_before,
                                                     predicate_written_scalar);
+  CaptureFragmentShaderVectorResultProbe(vector_result);
   if (scalar_result != spv::NoResult) {
     EnsureBuildPointAvailable();
     builder_->createStore(scalar_result, var_main_previous_scalar_);
@@ -98,6 +99,7 @@ void SpirvShaderTranslator::ProcessAluInstruction(const ParsedAluInstruction& in
   StoreResult(instr.vector_and_constant_result, vector_result,
               instr.GetMemExportStreamConstant() != UINT32_MAX);
   StoreResult(instr.scalar_result, scalar_result);
+  CaptureFragmentShaderRegisterProbe();
 
   if (predicate_written_vector || predicate_written_scalar) {
     cf_exec_predicate_written_ = true;

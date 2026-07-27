@@ -576,6 +576,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   void StartFragmentShaderBeforeMain();
   void StartFragmentShaderInMain();
+  void InitializeFragmentShaderRegisterProbe();
+  void CaptureFragmentShaderVectorResultProbe(spv::Id value);
+  void CaptureFragmentShaderRegisterProbe();
+  void CaptureFragmentShaderTextureFetchProbe(spv::Id value,
+                                              const char* source);
+  void ApplyFragmentShaderRegisterProbe();
+  void ApplyFragmentShaderOutputProbe();
   void CompleteFragmentShaderInMain();
 
   // Updates the current flow control condition (to be called in the beginning
@@ -974,6 +981,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_tfetch_gradients_v_;
   // float4[register_count()].
   spv::Id var_main_registers_;
+  // Debug-only snapshot of a guest register after a selected ALU instruction.
+  // float4.
+  spv::Id var_main_fragment_shader_register_probe_;
   // Memory export variables are created only when needed.
   // float4.
   spv::Id var_main_memexport_address_;

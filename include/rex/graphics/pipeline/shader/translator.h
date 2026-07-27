@@ -64,6 +64,12 @@ class ShaderTranslator {
   // Temporary register count, accessible via static and dynamic addressing.
   uint32_t register_count() const { return register_count_; }
 
+  // Address of the guest fetch or ALU instruction currently being translated,
+  // in 96-bit instruction units within the shader microcode.
+  uint32_t current_ucode_instruction_offset() const {
+    return current_ucode_instruction_offset_;
+  }
+
   // Emits a translation error that will be passed back in the result.
   virtual void EmitTranslationError(const char* message, bool is_fatal = true);
 
@@ -146,6 +152,9 @@ class ShaderTranslator {
 
   // Current control flow dword index.
   uint32_t cf_index_ = 0;
+
+  // Current fetch or ALU instruction address.
+  uint32_t current_ucode_instruction_offset_ = UINT32_MAX;
 
   // Kept for supporting vfetch_mini.
   ucode::VertexFetchInstruction previous_vfetch_full_;

@@ -11,17 +11,211 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 
 #include <SPIRV/GLSL.std.450.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 
+REXCVAR_DEFINE_STRING(vulkan_shader_output_probe, "", "GPU/Vulkan",
+                     "Pixel shader hash whose guest color output should be visualized")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_shader_output_probe_mode, "nonfinite", "GPU/Vulkan",
+                     "Guest color visualization: nonfinite, absolute, signed, "
+                     "opaque, or alpha")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_shader_register_probe, "", "GPU/Vulkan",
+                     "Pixel shader hash whose guest register should be visualized")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(vulkan_shader_register_probe_instruction, UINT32_MAX,
+                    "GPU/Vulkan",
+                    "Guest ALU instruction address after which to capture the register")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(vulkan_shader_register_probe_register, 0, "GPU/Vulkan",
+                    "Guest register index to capture")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_shader_register_probe_source, "register", "GPU/Vulkan",
+                     "Guest register probe source: register, vector_result, "
+                     "fetch_operand, fetch_coordinates, fetch_unsigned, or "
+                     "fetch_signed")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_shader_register_probe_mode, "signed", "GPU/Vulkan",
+                     "Guest register visualization: raw, absolute, signed, "
+                     "nonfinite, opaque, x, y, z, or w")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
+
+static bool IsFragmentShaderRegisterProbeTarget(
+    const Shader& shader, uint64_t& shader_hash_out) {
+  const std::string& shader_hash_string =
+      REXCVAR_GET(vulkan_shader_register_probe);
+  if (shader_hash_string.empty()) {
+    return false;
+  }
+  try {
+    shader_hash_out = std::stoull(shader_hash_string, nullptr, 16);
+  } catch (...) {
+    REXGPU_ERROR("Invalid Vulkan shader register probe hash: {}",
+                 shader_hash_string);
+    return false;
+  }
+  return shader_hash_out == shader.ucode_data_hash();
+}
+
+void SpirvShaderTranslator::InitializeFragmentShaderRegisterProbe() {
+  uint64_t shader_hash;
+  if (!IsFragmentShaderRegisterProbeTarget(current_shader(), shader_hash)) {
+    return;
+  }
+  const uint32_t register_index =
+      REXCVAR_GET(vulkan_shader_register_probe_register);
+  if (register_index >= register_count()) {
+    REXGPU_ERROR(
+        "Vulkan shader register probe r{} is outside the shader register "
+        "count {}",
+        register_index, register_count());
+    return;
+  }
+  var_main_fragment_shader_register_probe_ = builder_->createVariable(
+      spv::NoPrecision, spv::StorageClassFunction, type_float4_,
+      "xe_var_fragment_shader_register_probe", const_float4_0_);
+}
+
+void SpirvShaderTranslator::CaptureFragmentShaderRegisterProbe() {
+  if (var_main_fragment_shader_register_probe_ == spv::NoResult ||
+      REXCVAR_GET(vulkan_shader_register_probe_source) != "register" ||
+      current_ucode_instruction_offset() !=
+          REXCVAR_GET(vulkan_shader_register_probe_instruction)) {
+    return;
+  }
+  const uint32_t register_index =
+      REXCVAR_GET(vulkan_shader_register_probe_register);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(int(register_index)));
+  spv::Id register_pointer = builder_->createAccessChain(
+      spv::StorageClassFunction, var_main_registers_, id_vector_temp_);
+  builder_->createStore(
+      builder_->createLoad(register_pointer, spv::NoPrecision),
+      var_main_fragment_shader_register_probe_);
+}
+
+void SpirvShaderTranslator::CaptureFragmentShaderVectorResultProbe(
+    spv::Id value) {
+  if (var_main_fragment_shader_register_probe_ == spv::NoResult ||
+      REXCVAR_GET(vulkan_shader_register_probe_source) != "vector_result" ||
+      current_ucode_instruction_offset() !=
+          REXCVAR_GET(vulkan_shader_register_probe_instruction) ||
+      value == spv::NoResult) {
+    return;
+  }
+  if (builder_->getNumComponents(value) != 4) {
+    REXGPU_ERROR(
+        "Vulkan vector result probe at guest instruction {} has {} components, "
+        "expected 4",
+        current_ucode_instruction_offset(), builder_->getNumComponents(value));
+    return;
+  }
+  builder_->createStore(value, var_main_fragment_shader_register_probe_);
+}
+
+void SpirvShaderTranslator::CaptureFragmentShaderTextureFetchProbe(
+    spv::Id value, const char* source) {
+  if (var_main_fragment_shader_register_probe_ == spv::NoResult ||
+      REXCVAR_GET(vulkan_shader_register_probe_source) != source ||
+      current_ucode_instruction_offset() !=
+          REXCVAR_GET(vulkan_shader_register_probe_instruction) ||
+      value == spv::NoResult) {
+    return;
+  }
+  if (builder_->getNumComponents(value) != 4) {
+    REXGPU_ERROR(
+        "Vulkan texture fetch probe at guest instruction {} has {} "
+        "components, expected 4",
+        current_ucode_instruction_offset(), builder_->getNumComponents(value));
+    return;
+  }
+  builder_->createStore(value, var_main_fragment_shader_register_probe_);
+}
+
+void SpirvShaderTranslator::ApplyFragmentShaderRegisterProbe() {
+  if (var_main_fragment_shader_register_probe_ == spv::NoResult ||
+      !(current_shader().writes_color_targets() & 0b1) ||
+      output_or_var_fragment_data_[0] == spv::NoResult) {
+    return;
+  }
+
+  spv::Id value = builder_->createLoad(
+      var_main_fragment_shader_register_probe_, spv::NoPrecision);
+  const std::string& mode =
+      REXCVAR_GET(vulkan_shader_register_probe_mode);
+  spv::Id probed_color = value;
+  if (mode == "absolute") {
+    probed_color = builder_->createUnaryBuiltinCall(
+        type_float4_, ext_inst_glsl_std_450_, GLSLstd450FAbs, value);
+  } else if (mode == "signed") {
+    const spv::Id half = builder_->makeFloatConstant(0.5f);
+    probed_color = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float4_,
+        builder_->createNoContractionBinOp(
+            spv::OpFMul, type_float4_, value,
+            builder_->smearScalar(spv::NoPrecision, half, type_float4_)),
+        builder_->smearScalar(spv::NoPrecision, half, type_float4_));
+  } else if (mode == "opaque") {
+    probed_color = builder_->createCompositeInsert(
+        const_float_1_, value, type_float4_, 3);
+  } else if (mode == "x" || mode == "y" || mode == "z" || mode == "w") {
+    const uint32_t component =
+        mode == "x" ? 0 : mode == "y" ? 1 : mode == "z" ? 2 : 3;
+    spv::Id component_value =
+        builder_->createCompositeExtract(value, type_float_, component);
+    probed_color = builder_->smearScalar(
+        spv::NoPrecision, component_value, type_float4_);
+    probed_color = builder_->createCompositeInsert(
+        const_float_1_, probed_color, type_float4_, 3);
+  } else if (mode == "nonfinite") {
+    spv::Id any_infinite = builder_->createUnaryOp(
+        spv::OpAny, type_bool_,
+        builder_->createUnaryOp(spv::OpIsInf, type_bool4_, value));
+    spv::Id any_nan = builder_->createUnaryOp(
+        spv::OpAny, type_bool_,
+        builder_->createUnaryOp(spv::OpIsNan, type_bool4_, value));
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_float_0_);
+    id_vector_temp_.push_back(const_float_1_);
+    id_vector_temp_.push_back(const_float_1_);
+    id_vector_temp_.push_back(const_float_1_);
+    spv::Id infinite_color =
+        builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+    id_vector_temp_[0] = const_float_1_;
+    id_vector_temp_[1] = const_float_0_;
+    spv::Id nan_color =
+        builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+    probed_color = builder_->createTriOp(
+        spv::OpSelect, type_float4_, any_infinite, infinite_color, value);
+    probed_color = builder_->createTriOp(
+        spv::OpSelect, type_float4_, any_nan, nan_color, probed_color);
+  } else if (mode != "raw") {
+    REXGPU_ERROR("Invalid Vulkan shader register probe mode: {}", mode);
+    return;
+  }
+
+  builder_->createStore(probed_color, output_or_var_fragment_data_[0]);
+  REXGPU_INFO(
+      "Probing pixel shader {:016X} r{} after guest instruction {} with {} "
+      "visualization from {}",
+      current_shader().ucode_data_hash(),
+      REXCVAR_GET(vulkan_shader_register_probe_register),
+      REXCVAR_GET(vulkan_shader_register_probe_instruction), mode,
+      REXCVAR_GET(vulkan_shader_register_probe_source));
+}
 
 spv::Id SpirvShaderTranslator::PreClampedFloat32To7e3(SpirvBuilder& builder, spv::Id f32_scalar,
                                                       spv::Id ext_inst_glsl_std_450) {
@@ -394,7 +588,88 @@ spv::Id SpirvShaderTranslator::Depth20e4To32(SpirvBuilder& builder, spv::Id f24_
   return f32;
 }
 
+void SpirvShaderTranslator::ApplyFragmentShaderOutputProbe() {
+  const std::string& shader_hash_string =
+      REXCVAR_GET(vulkan_shader_output_probe);
+  if (shader_hash_string.empty() ||
+      !(current_shader().writes_color_targets() & 0b1) ||
+      output_or_var_fragment_data_[0] == spv::NoResult) {
+    return;
+  }
+
+  uint64_t shader_hash;
+  try {
+    shader_hash = std::stoull(shader_hash_string, nullptr, 16);
+  } catch (...) {
+    REXGPU_ERROR("Invalid Vulkan shader output probe hash: {}",
+                 shader_hash_string);
+    return;
+  }
+  if (shader_hash != current_shader().ucode_data_hash()) {
+    return;
+  }
+
+  const std::string& mode = REXCVAR_GET(vulkan_shader_output_probe_mode);
+  spv::Id color =
+      builder_->createLoad(output_or_var_fragment_data_[0], spv::NoPrecision);
+  spv::Id probed_color;
+  if (mode == "nonfinite") {
+    spv::Id any_infinite = builder_->createUnaryOp(
+        spv::OpAny, type_bool_,
+        builder_->createUnaryOp(spv::OpIsInf, type_bool4_, color));
+    spv::Id any_nan = builder_->createUnaryOp(
+        spv::OpAny, type_bool_,
+        builder_->createUnaryOp(spv::OpIsNan, type_bool4_, color));
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_float_0_);
+    id_vector_temp_.push_back(const_float_1_);
+    id_vector_temp_.push_back(const_float_1_);
+    id_vector_temp_.push_back(const_float_1_);
+    spv::Id infinite_color =
+        builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+    id_vector_temp_[0] = const_float_1_;
+    id_vector_temp_[1] = const_float_0_;
+    spv::Id nan_color =
+        builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
+    probed_color = builder_->createTriOp(
+        spv::OpSelect, type_float4_, any_infinite, infinite_color, color);
+    probed_color = builder_->createTriOp(
+        spv::OpSelect, type_float4_, any_nan, nan_color, probed_color);
+  } else if (mode == "absolute") {
+    probed_color = builder_->createUnaryBuiltinCall(
+        type_float4_, ext_inst_glsl_std_450_, GLSLstd450FAbs, color);
+  } else if (mode == "signed") {
+    const spv::Id half = builder_->makeFloatConstant(0.5f);
+    probed_color = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float4_,
+        builder_->createNoContractionBinOp(
+            spv::OpFMul, type_float4_, color,
+            builder_->smearScalar(spv::NoPrecision, half, type_float4_)),
+        builder_->smearScalar(spv::NoPrecision, half, type_float4_));
+  } else if (mode == "opaque") {
+    probed_color = builder_->createCompositeInsert(
+        const_float_1_, color, type_float4_, 3);
+  } else if (mode == "alpha") {
+    spv::Id alpha = builder_->createCompositeExtract(
+        color, type_float_, 3);
+    probed_color =
+        builder_->smearScalar(spv::NoPrecision, alpha, type_float4_);
+    probed_color = builder_->createCompositeInsert(
+        const_float_1_, probed_color, type_float4_, 3);
+  } else {
+    REXGPU_ERROR("Invalid Vulkan shader output probe mode: {}", mode);
+    return;
+  }
+
+  builder_->createStore(probed_color, output_or_var_fragment_data_[0]);
+  REXGPU_INFO("Probing pixel shader {:016X} guest output with {} visualization",
+              shader_hash, mode);
+}
+
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+  ApplyFragmentShaderRegisterProbe();
+  ApplyFragmentShaderOutputProbe();
+
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
 

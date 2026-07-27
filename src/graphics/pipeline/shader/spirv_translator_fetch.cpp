@@ -975,6 +975,16 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       rex::bit_scan_forward(coordinates_needed_components, &coordinate_component_index);
       coordinates[coordinate_component_index] = coordinates_operand;
     }
+    if (instr.opcode == ucode::FetchOpcode::kTextureFetch) {
+      id_vector_temp_.clear();
+      for (uint32_t i = 0; i < 3; ++i) {
+        id_vector_temp_.push_back(coordinates[i]);
+      }
+      id_vector_temp_.push_back(const_float_1_);
+      CaptureFragmentShaderTextureFetchProbe(
+          builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+          "fetch_operand");
+    }
     spv::Id texture_resolution_scaled = spv::NoResult;
     uint32_t revert_resolution_scale_axes =
         REXCVAR_GET(draw_resolution_scaled_texture_offsets)
@@ -1852,9 +1862,17 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
           texture_parameters.coords =
               builder_->createCompositeConstruct(type_float3_, id_vector_temp_);
+          id_vector_temp_.push_back(const_float_1_);
+          CaptureFragmentShaderTextureFetchProbe(
+              builder_->createCompositeConstruct(type_float4_, id_vector_temp_),
+              "fetch_coordinates");
           SampleTexture(texture_parameters, image_operands_mask, image_2d_array_or_cube_unsigned,
                         image_2d_array_or_cube_signed, sampler, is_any_unsigned, is_any_signed,
                         sample_result_unsigned, sample_result_signed);
+          CaptureFragmentShaderTextureFetchProbe(sample_result_unsigned,
+                                                 "fetch_unsigned");
+          CaptureFragmentShaderTextureFetchProbe(sample_result_signed,
+                                                 "fetch_signed");
         }
 
         // Swizzle the result components manually if needed, to `result`.
@@ -2034,11 +2052,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
 
-        // Apply the exponent bias from the bits 13:18 of the fetch constant
-        // word 4.
+        // Apply the exponent bias from bits 13:18 of fetch constant word 3.
+        id_vector_temp_.clear();
+        id_vector_temp_.push_back(const_int_0_);
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
+        id_vector_temp_.push_back(
+            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
+        spv::Id fetch_constant_word_3 = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform,
+                                        uniform_fetch_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+        spv::Id fetch_constant_word_3_signed =
+            builder_->createUnaryOp(spv::OpBitcast, type_int_,
+                                    fetch_constant_word_3);
         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
+            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
         {
           uint32_t result_remaining_components = used_result_nonzero_components;

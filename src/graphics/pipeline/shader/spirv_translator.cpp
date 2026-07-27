@@ -137,6 +137,7 @@ void SpirvShaderTranslator::Reset() {
 
   main_interface_.clear();
   var_main_registers_ = spv::NoResult;
+  var_main_fragment_shader_register_probe_ = spv::NoResult;
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0; memexport_eM_index < rex::countof(var_main_memexport_data_);
        ++memexport_eM_index) {
@@ -3007,6 +3008,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
 }
 
 void SpirvShaderTranslator::StartFragmentShaderInMain() {
+  InitializeFragmentShaderRegisterProbe();
+
   // Set up pixel killing from within the translated shader without affecting
   // the control flow (unlike with OpKill), similarly to how pixel killing works
   // on the Xenos, and also keeping a single critical section exit and return
