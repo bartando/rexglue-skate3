@@ -95,6 +95,7 @@ class TraceViewer : public rex::ui::WindowedApp {
   static constexpr float kWindowBgAlpha = 0.6f;
 
   bool Load(const std::string_view trace_file_path);
+  void DumpTraceToLog();
 
   void DrawUI();
   void DrawControllerUI();

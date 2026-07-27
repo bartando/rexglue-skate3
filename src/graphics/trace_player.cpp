@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <exception>
 #include <memory>
 
 #include <rex/graphics/command_processor.h>
@@ -86,7 +87,19 @@ void TracePlayer::PlayTrace(const uint8_t* trace_data, size_t trace_size,
                             TracePlaybackMode playback_mode, bool clear_caches) {
   playing_trace_ = true;
   graphics_system_->command_processor()->CallInThread(
-      [=]() { PlayTraceOnThread(trace_data, trace_size, playback_mode, clear_caches); });
+      [=, this]() {
+        try {
+          PlayTraceOnThread(trace_data, trace_size, playback_mode, clear_caches);
+        } catch (const std::exception& exception) {
+          REXGPU_ERROR("Trace playback failed: {}", exception.what());
+          playing_trace_ = false;
+          playback_event_->Set();
+        } catch (...) {
+          REXGPU_ERROR("Trace playback failed with an unknown exception");
+          playing_trace_ = false;
+          playback_event_->Set();
+        }
+      });
 }
 
 void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size,
@@ -152,6 +165,7 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
         }
         if (pending_break) {
           playing_trace_ = false;
+          playback_event_->Set();
           return;
         }
         break;
@@ -160,7 +174,8 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
         auto cmd = reinterpret_cast<const MemoryCommand*>(trace_ptr);
         trace_ptr += sizeof(*cmd);
         DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
-                         memory->TranslatePhysical(cmd->base_ptr), cmd->decoded_length);
+                         memory->TranslatePhysical(cmd->base_ptr),
+                         cmd->decoded_length);
         trace_ptr += cmd->encoded_length;
         command_processor->TracePlaybackWroteMemory(cmd->base_ptr, cmd->decoded_length);
         break;

@@ -9,10 +9,16 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include "thirdparty/half/include/half.hpp"
-
+#include <algorithm>
 #include <cinttypes>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
 #include <string>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -21,6 +27,7 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/packet_disassembler.h>
+#include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/sampler_info.h>
@@ -33,7 +40,6 @@
 #include <rex/system.h>
 #include <rex/system/kernel_state.h>
 #include <rex/thread.h>
-#include <rex/ui/file_picker.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/immediate_drawer.h>
 #include <rex/ui/presenter.h>
@@ -44,7 +50,22 @@
 
 #include <imgui.h>
 
-DEFINE_string(target_trace_file, "", "Specifies the trace file to load.", "GPU");
+REXCVAR_DEFINE_STRING(target_trace_file, "", "GPU", "Specifies the trace file to load");
+REXCVAR_DEFINE_BOOL(trace_dump, false, "GPU", "Dump trace draw state to the log and exit");
+REXCVAR_DEFINE_STRING(trace_dump_shader, "", "GPU",
+                     "Shader hash to include detailed state for while dumping a trace");
+REXCVAR_DEFINE_INT32(
+    trace_dump_detail_start_command, -1, "GPU",
+    "First command eligible for detailed shader state (-1 for the first matching draw)");
+REXCVAR_DEFINE_INT32(
+    trace_dump_detail_draw_count, 9, "GPU",
+    "Maximum matching draws with detailed shader state (0 disables the limit)");
+REXCVAR_DEFINE_INT32(trace_dump_end_command, -1, "GPU",
+                    "Stop a textual trace dump after this command (-1 for the whole trace)");
+REXCVAR_DEFINE_STRING(trace_dump_textures, "", "GPU",
+                     "Directory for supported textures referenced by detailed trace draws");
+REXCVAR_DEFINE_STRING(trace_dump_frame, "", "GPU",
+                     "PPM output path after replaying the dumped trace");
 
 namespace rex::graphics {
 
@@ -53,6 +74,118 @@ using namespace rex::graphics::xenos;
 static const ImVec4 kColorError = ImVec4(255 / 255.0f, 0 / 255.0f, 0 / 255.0f, 255 / 255.0f);
 static const ImVec4 kColorComment = ImVec4(42 / 255.0f, 179 / 255.0f, 0 / 255.0f, 255 / 255.0f);
 static const ImVec4 kColorIgnored = ImVec4(100 / 255.0f, 100 / 255.0f, 100 / 255.0f, 255 / 255.0f);
+
+static float Float16ToFloat(uint16_t value) {
+  _Float16 half;
+  std::memcpy(&half, &value, sizeof(half));
+  return static_cast<float>(half);
+}
+
+static bool DumpTextureDDS(const TextureInfo& texture_info, const uint8_t* texture_data,
+                           const std::filesystem::path& path) {
+  const FormatInfo* format_info = texture_info.format_info();
+  uint32_t fourcc;
+  switch (texture_info.format) {
+    case xenos::TextureFormat::k_DXT1:
+      fourcc = UINT32_C(0x31545844);  // DXT1
+      break;
+    case xenos::TextureFormat::k_DXT2_3:
+      fourcc = UINT32_C(0x33545844);  // DXT3
+      break;
+    case xenos::TextureFormat::k_DXT4_5:
+      fourcc = UINT32_C(0x35545844);  // DXT5
+      break;
+    default:
+      return false;
+  }
+  if (texture_info.dimension != xenos::DataDimension::k2DOrStacked ||
+      texture_info.depth != 0) {
+    return false;
+  }
+
+  const uint32_t width = texture_info.width + 1;
+  const uint32_t height = texture_info.height + 1;
+  const uint32_t width_blocks =
+      (width + format_info->block_width - 1) / format_info->block_width;
+  const uint32_t height_blocks =
+      (height + format_info->block_height - 1) / format_info->block_height;
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  std::vector<uint8_t> linear_data(size_t(width_blocks) * height_blocks * bytes_per_block);
+
+  auto copy_block = [endianness = texture_info.endianness](
+                        void* output, const void* input, size_t length) {
+    texture_conversion::CopySwapBlock(endianness, output, input, length);
+  };
+  if (texture_info.is_tiled) {
+    texture_conversion::UntileInfo untile_info{
+        .offset_x = 0,
+        .offset_y = 0,
+        .width = width_blocks,
+        .height = height_blocks,
+        .input_pitch = texture_info.extent.block_pitch_h,
+        .output_pitch = width_blocks,
+        .input_format_info = format_info,
+        .output_format_info = format_info,
+        .copy_callback = copy_block,
+    };
+    texture_conversion::Untile(linear_data.data(), texture_data, &untile_info);
+  } else {
+    const size_t input_row_size = size_t(texture_info.extent.block_pitch_h) * bytes_per_block;
+    const size_t output_row_size = size_t(width_blocks) * bytes_per_block;
+    for (uint32_t y = 0; y < height_blocks; ++y) {
+      copy_block(linear_data.data() + y * output_row_size,
+                 texture_data + y * input_row_size, output_row_size);
+    }
+  }
+
+  std::error_code error;
+  std::filesystem::create_directories(path.parent_path(), error);
+  if (error) {
+    return false;
+  }
+
+  // DDS_HEADER with a legacy DXT FourCC, including the four-byte magic.
+  uint32_t dds[32] = {};
+  dds[0] = UINT32_C(0x20534444);   // "DDS "
+  dds[1] = 124;                    // DDS_HEADER size
+  dds[2] = UINT32_C(0x000A1007);   // CAPS | HEIGHT | WIDTH | PIXELFORMAT | LINEARSIZE
+  dds[3] = height;
+  dds[4] = width;
+  dds[5] = uint32_t(linear_data.size());
+  dds[7] = 1;
+  dds[19] = 32;                    // DDS_PIXELFORMAT size
+  dds[20] = UINT32_C(0x00000004);  // DDPF_FOURCC
+  dds[21] = fourcc;
+  dds[27] = UINT32_C(0x00001000);  // DDSCAPS_TEXTURE
+
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    return false;
+  }
+  output.write(reinterpret_cast<const char*>(dds), sizeof(dds));
+  output.write(reinterpret_cast<const char*>(linear_data.data()), linear_data.size());
+  return output.good();
+}
+
+static bool DumpGuestOutputPPM(ui::Presenter* presenter,
+                               const std::filesystem::path& path) {
+  ui::RawImage image;
+  if (!presenter || !presenter->CaptureGuestOutput(image)) {
+    return false;
+  }
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    return false;
+  }
+  output << "P6\n" << image.width << " " << image.height << "\n255\n";
+  for (uint32_t y = 0; y < image.height; ++y) {
+    const uint8_t* row = image.data.data() + y * image.stride;
+    for (uint32_t x = 0; x < image.width; ++x) {
+      output.write(reinterpret_cast<const char*>(row + x * 4), 3);
+    }
+  }
+  return output.good();
+}
 
 TraceViewer::TraceViewer(rex::ui::WindowedAppContext& app_context, const std::string_view name)
     : rex::ui::WindowedApp(app_context, name, "some.trace"), window_listener_(*this) {
@@ -63,30 +196,6 @@ TraceViewer::~TraceViewer() = default;
 
 bool TraceViewer::OnInitialize() {
   std::string path = REXCVAR_GET(target_trace_file);
-
-  // If no path passed, ask the user.
-  // On Android, however, there's no synchronous file picker, and the trace file
-  // must be picked externally and provided to the trace viewer activity via the
-  // intent.
-#if !REX_PLATFORM_ANDROID
-  if (path.empty()) {
-    auto file_picker = rex::ui::FilePicker::Create();
-    file_picker->set_mode(ui::FilePicker::Mode::kOpen);
-    file_picker->set_type(ui::FilePicker::Type::kFile);
-    file_picker->set_multi_selection(false);
-    file_picker->set_title("Select Trace File");
-    file_picker->set_extensions({
-        {"Supported Files", "*.xtr"},
-        {"All Files (*.*)", "*.*"},
-    });
-    if (file_picker->Show()) {
-      auto selected_files = file_picker->selected_files();
-      if (!selected_files.empty()) {
-        path = rex::path_to_utf8(selected_files[0]);
-      }
-    }
-  }
-#endif  // !REX_PLATFORM_ANDROID
 
   if (path.empty()) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Warning, "No trace file specified");
@@ -121,16 +230,22 @@ bool TraceViewer::Setup() {
     return false;
   }
 
-  // Create the emulator but don't initialize so we can setup the window.
-  emulator_ = std::make_unique<Emulator>("", "", "", "");
-  X_STATUS result = emulator_->Setup(
-      window_.get(), nullptr, false, nullptr, [this]() { return CreateGraphicsSystem(); }, nullptr);
+  emulator_ = std::make_unique<Runtime>("");
+  emulator_->set_app_context(&app_context());
+  emulator_->set_display_window(window_.get());
+  RuntimeConfig runtime_config;
+  runtime_config.graphics = CreateGraphicsSystem();
+  X_STATUS result = emulator_->Setup(std::move(runtime_config));
   if (XFAILED(result)) {
     REXGPU_ERROR("Failed to setup emulator: {:08X}", result);
     return false;
   }
   memory_ = emulator_->memory();
-  graphics_system_ = emulator_->graphics_system();
+  graphics_system_ = dynamic_cast<GraphicsSystem*>(emulator_->graphics_system());
+  if (!graphics_system_) {
+    REXGPU_ERROR("Runtime did not create a compatible graphics system");
+    return false;
+  }
 
   player_ = std::make_unique<TracePlayer>(graphics_system_);
 
@@ -183,7 +298,417 @@ bool TraceViewer::Load(const std::string_view trace_file_path) {
     return false;
   }
 
+  if (REXCVAR_GET(trace_dump)) {
+    DumpTraceToLog();
+    app_context().QuitFromUIThread();
+  }
+
   return true;
+}
+
+void TraceViewer::DumpTraceToLog() {
+  struct ShaderStats {
+    uint32_t draw_count = 0;
+    int first_frame = -1;
+    int first_command = -1;
+    size_t ucode_dwords = 0;
+    size_t texture_bindings = 0;
+  };
+
+  uint64_t detail_shader_hash = 0;
+  const std::string& detail_shader = REXCVAR_GET(trace_dump_shader);
+  if (!detail_shader.empty()) {
+    try {
+      detail_shader_hash = std::stoull(detail_shader, nullptr, 16);
+    } catch (...) {
+      REXGPU_ERROR("Invalid trace_dump_shader hash: {}", detail_shader);
+      return;
+    }
+  }
+
+  std::map<uint64_t, ShaderStats> pixel_shader_stats;
+  uint32_t total_draws = 0;
+  uint32_t detailed_draws = 0;
+  const int32_t detail_start_command =
+      REXCVAR_GET(trace_dump_detail_start_command);
+  const int32_t detail_draw_count =
+      REXCVAR_GET(trace_dump_detail_draw_count);
+  const int32_t end_command = REXCVAR_GET(trace_dump_end_command);
+  const std::filesystem::path texture_dump_path = REXCVAR_GET(trace_dump_textures);
+  std::set<std::pair<uint32_t, uint32_t>> dumped_textures;
+
+  for (int frame_index = 0; frame_index < player_->frame_count(); ++frame_index) {
+    if (player_->current_frame_index() != frame_index) {
+      player_->SeekFrame(frame_index);
+      player_->WaitOnPlayback();
+      player_->SeekCommand(-1);
+    }
+    const TraceReader::Frame* frame = player_->current_frame();
+    REXGPU_INFO("TRACE_FRAME frame={} commands={}", frame_index, frame->commands.size());
+
+    for (int command_index = 0; command_index < int(frame->commands.size()); ++command_index) {
+      if (end_command >= 0 && command_index > end_command) {
+        break;
+      }
+      const TraceReader::Frame::Command& command = frame->commands[command_index];
+      if (command.type != TraceReader::Frame::Command::Type::kDraw) {
+        continue;
+      }
+
+      player_->SeekCommand(command_index);
+      player_->WaitOnPlayback();
+      ++total_draws;
+
+      CommandProcessor* command_processor = graphics_system_->command_processor();
+      Shader* vertex_shader = command_processor->active_vertex_shader();
+      Shader* pixel_shader = command_processor->active_pixel_shader();
+      const uint64_t vertex_shader_hash =
+          vertex_shader ? vertex_shader->ucode_data_hash() : 0;
+      const uint64_t pixel_shader_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+
+      uint32_t index_count = 0;
+      uint32_t primitive_type = 0;
+      uint32_t index_buffer_base = 0;
+      uint32_t index_buffer_size = 0;
+      bool indexed = false;
+      const uint8_t* packet_head = command.head_ptr + sizeof(PacketStartCommand);
+      const uint32_t packet = memory::load_and_swap<uint32_t>(packet_head);
+      const uint32_t opcode = (packet >> 8) & 0x7F;
+      if (opcode == PM4_DRAW_INDX) {
+        const uint32_t draw_initiator =
+            memory::load_and_swap<uint32_t>(packet_head + 8);
+        index_count = draw_initiator >> 16;
+        primitive_type = draw_initiator & 0x3F;
+        indexed = ((draw_initiator >> 6) & 0x3) == 0;
+        if (indexed) {
+          index_buffer_base =
+              memory::load_and_swap<uint32_t>(packet_head + 12);
+          uint32_t index_buffer_elements =
+              memory::load_and_swap<uint32_t>(packet_head + 16) & 0x00FFFFFF;
+          const bool index_32bit = ((draw_initiator >> 11) & 1) != 0;
+          index_buffer_size =
+              index_buffer_elements * (index_32bit ? 4 : 2);
+        }
+      } else if (opcode == PM4_DRAW_INDX_2) {
+        const uint32_t draw_initiator =
+            memory::load_and_swap<uint32_t>(packet_head + 4);
+        index_count = draw_initiator >> 16;
+        primitive_type = draw_initiator & 0x3F;
+      }
+
+      ShaderStats& stats = pixel_shader_stats[pixel_shader_hash];
+      ++stats.draw_count;
+      if (stats.first_frame < 0) {
+        stats.first_frame = frame_index;
+        stats.first_command = command_index;
+        stats.ucode_dwords = pixel_shader ? pixel_shader->ucode_dword_count() : 0;
+        stats.texture_bindings = pixel_shader ? pixel_shader->texture_bindings().size() : 0;
+      }
+
+      REXGPU_INFO(
+          "TRACE_DRAW frame={} command={} indices={} primitive={} indexed={} "
+          "index_base={:08X} index_bytes={} vs={:016X} ps={:016X} "
+          "ps_textures={}",
+          frame_index, command_index, index_count, primitive_type, indexed,
+          index_buffer_base, index_buffer_size, vertex_shader_hash,
+          pixel_shader_hash,
+          pixel_shader ? pixel_shader->texture_bindings().size() : 0);
+
+      const bool before_detail_start =
+          detail_start_command >= 0 && command_index < detail_start_command;
+      const bool detail_limit_reached =
+          detail_draw_count > 0 &&
+          detailed_draws >= static_cast<uint32_t>(detail_draw_count);
+      if (!pixel_shader || pixel_shader_hash != detail_shader_hash ||
+          before_detail_start || detail_limit_reached) {
+        continue;
+      }
+      ++detailed_draws;
+
+      RegisterFile& regs = *graphics_system_->register_file();
+      const reg::SQ_VS_CONST vs_constants = regs.Get<reg::SQ_VS_CONST>();
+      const reg::SQ_PS_CONST ps_constants = regs.Get<reg::SQ_PS_CONST>();
+      const reg::RB_COLOR_INFO color_info =
+          regs.Get<reg::RB_COLOR_INFO>();
+      const reg::RB_COLORCONTROL color_control =
+          regs.Get<reg::RB_COLORCONTROL>();
+      const reg::RB_DEPTHCONTROL depth_control =
+          regs.Get<reg::RB_DEPTHCONTROL>();
+      const reg::RB_BLENDCONTROL blend_control =
+          regs.Get<reg::RB_BLENDCONTROL>();
+      const reg::PA_SU_SC_MODE_CNTL mode_control =
+          regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+      REXGPU_INFO(
+          "TRACE_SHADER_DETAIL draw={} frame={} command={} ps={:016X} ucode_dwords={} "
+          "constant_base={} constant_size={} texture_bindings={}",
+          detailed_draws, frame_index, command_index, pixel_shader_hash,
+          pixel_shader->ucode_dword_count(), ps_constants.base, ps_constants.size + 1,
+          pixel_shader->texture_bindings().size());
+      REXGPU_INFO(
+          "TRACE_RASTER color_info={:08X} color_format={} exp_bias={} "
+          "color_control={:08X} blend_control={:08X} "
+          "depth_control={:08X} mode_control={:08X}",
+          color_info.value, uint32_t(color_info.color_format),
+          int32_t(color_info.color_exp_bias), color_control.value,
+          blend_control.value, depth_control.value, mode_control.value);
+
+      if (vertex_shader) {
+        REXGPU_INFO(
+            "TRACE_VERTEX_STATE vs={:016X} constant_base={} constant_size={} "
+            "vertex_bindings={}",
+            vertex_shader_hash, vs_constants.base, vs_constants.size + 1,
+            vertex_shader->vertex_bindings().size());
+        for (const Shader::VertexBinding& binding :
+             vertex_shader->vertex_bindings()) {
+          const xenos::xe_gpu_vertex_fetch_t fetch =
+              regs.GetVertexFetch(binding.fetch_constant);
+          const uint32_t byte_address = fetch.address << 2;
+          const uint32_t byte_size = fetch.size << 2;
+          const uint32_t sample_word_count =
+              std::min(fetch.size, binding.stride_words * 2);
+          const uint8_t* fetch_data =
+              memory_->TranslatePhysical(byte_address);
+          uint64_t sample_hash = UINT64_C(1469598103934665603);
+          std::string sample_words;
+          sample_words.reserve(sample_word_count * 9);
+          for (uint32_t word = 0; word < sample_word_count; ++word) {
+            const uint32_t value = xenos::GpuSwap(
+                memory::load<uint32_t>(fetch_data + word * sizeof(uint32_t)),
+                fetch.endian);
+            sample_hash =
+                (sample_hash ^ value) * UINT64_C(1099511628211);
+            if (!sample_words.empty()) {
+              sample_words.push_back(',');
+            }
+            char formatted_word[9];
+            std::snprintf(formatted_word, sizeof(formatted_word), "%08X",
+                          value);
+            sample_words.append(formatted_word);
+          }
+          uint32_t first_nonzero_vertex = UINT32_MAX;
+          std::string first_nonzero_words;
+          const uint32_t stride_words = binding.stride_words;
+          if (stride_words != 0) {
+            const uint32_t vertex_count = fetch.size / stride_words;
+            for (uint32_t vertex = 0; vertex < vertex_count; ++vertex) {
+              const uint8_t* vertex_data =
+                  fetch_data + size_t(vertex) * stride_words *
+                                   sizeof(uint32_t);
+              bool nonzero = false;
+              for (uint32_t word = 0; word < stride_words; ++word) {
+                nonzero |= xenos::GpuSwap(
+                               memory::load<uint32_t>(
+                                   vertex_data + word * sizeof(uint32_t)),
+                               fetch.endian) != 0;
+              }
+              if (!nonzero) {
+                continue;
+              }
+              first_nonzero_vertex = vertex;
+              first_nonzero_words.reserve(stride_words * 9);
+              for (uint32_t word = 0; word < stride_words; ++word) {
+                if (!first_nonzero_words.empty()) {
+                  first_nonzero_words.push_back(',');
+                }
+                const uint32_t value = xenos::GpuSwap(
+                    memory::load<uint32_t>(
+                        vertex_data + word * sizeof(uint32_t)),
+                    fetch.endian);
+                char formatted_word[9];
+                std::snprintf(formatted_word, sizeof(formatted_word), "%08X",
+                              value);
+                first_nonzero_words.append(formatted_word);
+              }
+              break;
+            }
+          }
+          REXGPU_INFO(
+              "TRACE_VERTEX_BUFFER vf={} binding={} address={:08X} size={} "
+              "endian={} stride_words={} attributes={} sample_hash={:016X} "
+              "sample_words={} first_nonzero_vertex={} "
+              "first_nonzero_words={}",
+              binding.fetch_constant, binding.binding_index, byte_address,
+              byte_size, uint32_t(fetch.endian), binding.stride_words,
+              binding.attributes.size(), sample_hash, sample_words,
+              first_nonzero_vertex, first_nonzero_words);
+          for (size_t attribute_index = 0;
+               attribute_index < binding.attributes.size();
+               ++attribute_index) {
+            const ParsedVertexFetchInstruction& instruction =
+                binding.attributes[attribute_index].fetch_instr;
+            const auto& attributes = instruction.attributes;
+            const InstructionResult& result = instruction.result;
+            REXGPU_INFO(
+                "TRACE_VERTEX_ATTRIBUTE vf={} binding={} attribute={} "
+                "format={} offset={} stride_words={} exp_adjust={} "
+                "signed={} integer={} mini={} target={} target_index={} "
+                "write_mask={:X} swizzle={}{}{}{}",
+                binding.fetch_constant, binding.binding_index,
+                attribute_index, uint32_t(attributes.data_format),
+                attributes.offset, attributes.stride,
+                attributes.exp_adjust, attributes.is_signed,
+                attributes.is_integer, instruction.is_mini_fetch,
+                uint32_t(result.storage_target), result.storage_index,
+                result.original_write_mask,
+                GetCharForSwizzle(result.components[0]),
+                GetCharForSwizzle(result.components[1]),
+                GetCharForSwizzle(result.components[2]),
+                GetCharForSwizzle(result.components[3]));
+          }
+        }
+
+        const Shader::ConstantRegisterMap& constants =
+            vertex_shader->constant_register_map();
+        for (uint32_t constant = 0; constant < 256; ++constant) {
+          if (!(constants.float_bitmap[constant / 64] &
+                (UINT64_C(1) << (constant % 64)))) {
+            continue;
+          }
+          const uint32_t register_index =
+              XE_GPU_REG_SHADER_CONSTANT_000_X +
+              4 * (vs_constants.base + constant);
+          REXGPU_INFO(
+              "TRACE_VERTEX_CONSTANT c{}={},{},{},{}", constant,
+              regs.Get<float>(register_index + 0),
+              regs.Get<float>(register_index + 1),
+              regs.Get<float>(register_index + 2),
+              regs.Get<float>(register_index + 3));
+        }
+      }
+
+      std::set<uint32_t> dumped_texture_slots;
+      for (const Shader::TextureBinding& binding : pixel_shader->texture_bindings()) {
+        const uint32_t slot = binding.fetch_constant;
+        if (!dumped_texture_slots.insert(slot).second) {
+          continue;
+        }
+        const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(slot);
+        TextureInfo texture_info;
+        SamplerInfo sampler_info{};
+        const bool valid_type =
+            fetch.type == xenos::FetchConstantType::kTexture ||
+            (REXCVAR_GET(gpu_allow_invalid_fetch_constants) &&
+             fetch.type == xenos::FetchConstantType::kInvalidTexture);
+        const bool valid_info = valid_type && TextureInfo::Prepare(fetch, &texture_info);
+        const bool valid_sampler =
+            valid_type &&
+            SamplerInfo::Prepare(fetch, binding.fetch_instr, &sampler_info);
+
+        const uint32_t* raw_fetch =
+            &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * slot];
+        if (!valid_info) {
+          REXGPU_INFO(
+              "TRACE_TEXTURE slot={} binding={} invalid type={} raw={:08X},{:08X},{:08X},"
+              "{:08X},{:08X},{:08X}",
+              slot, binding.binding_index, uint32_t(fetch.type), raw_fetch[0], raw_fetch[1],
+              raw_fetch[2], raw_fetch[3], raw_fetch[4], raw_fetch[5]);
+          continue;
+        }
+
+        const size_t sample_size = texture_info.memory.base_size;
+        const uint8_t* texture_data =
+            memory_->TranslatePhysical(texture_info.memory.base_address);
+        uint64_t sample_hash = UINT64_C(1469598103934665603);
+        size_t zero_bytes = 0;
+        for (size_t i = 0; i < sample_size; ++i) {
+          const uint8_t value = texture_data[i];
+          zero_bytes += value == 0;
+          sample_hash = (sample_hash ^ value) * UINT64_C(1099511628211);
+        }
+        REXGPU_INFO(
+            "TRACE_TEXTURE slot={} binding={} address={:08X} size={} format={} dimensions={}x{}x{} "
+            "tiled={} mips={}-{} mip_address={:08X} mip_size={} endian={} swizzle={:03X} "
+            "sample_bytes={} zero_bytes={} sample_hash={:016X} "
+            "raw={:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
+            slot, binding.binding_index, texture_info.memory.base_address,
+            texture_info.memory.base_size, texture_info.format_info()->name, texture_info.width + 1,
+            texture_info.height + 1, texture_info.depth + 1, texture_info.is_tiled,
+            texture_info.mip_min_level, texture_info.mip_max_level,
+            texture_info.memory.mip_address, texture_info.memory.mip_size,
+            uint32_t(texture_info.endianness), fetch.swizzle, sample_size, zero_bytes,
+            sample_hash, raw_fetch[0], raw_fetch[1], raw_fetch[2], raw_fetch[3], raw_fetch[4],
+            raw_fetch[5]);
+        if (valid_sampler) {
+          REXGPU_INFO(
+              "TRACE_SAMPLER slot={} binding={} min={} mag={} mip={} "
+              "clamp={}/{}/{} aniso={} border={} lod_bias={} mips={}-{}",
+              slot, binding.binding_index,
+              uint32_t(sampler_info.min_filter),
+              uint32_t(sampler_info.mag_filter),
+              uint32_t(sampler_info.mip_filter),
+              uint32_t(sampler_info.clamp_u),
+              uint32_t(sampler_info.clamp_v),
+              uint32_t(sampler_info.clamp_w),
+              uint32_t(sampler_info.aniso_filter),
+              uint32_t(sampler_info.border_color), sampler_info.lod_bias,
+              sampler_info.mip_min_level, sampler_info.mip_max_level);
+        } else {
+          REXGPU_INFO("TRACE_SAMPLER slot={} binding={} invalid", slot,
+                      binding.binding_index);
+        }
+
+        if (!texture_dump_path.empty() &&
+            dumped_textures.emplace(texture_info.memory.base_address,
+                                    uint32_t(texture_info.format))
+                .second) {
+          char texture_filename[128];
+          std::snprintf(texture_filename, sizeof(texture_filename),
+                        "command_%04d_slot_%02u_addr_%08X.dds", command_index, slot,
+                        texture_info.memory.base_address);
+          const std::filesystem::path texture_path =
+              texture_dump_path / texture_filename;
+          if (DumpTextureDDS(texture_info, texture_data, texture_path)) {
+            REXGPU_INFO("TRACE_TEXTURE_DUMP command={} slot={} path={}", command_index,
+                        slot, texture_path.string());
+          } else {
+            REXGPU_WARN(
+                "TRACE_TEXTURE_DUMP unsupported or failed command={} slot={} format={}",
+                command_index, slot, texture_info.format_info()->name);
+          }
+        }
+      }
+
+      const Shader::ConstantRegisterMap& constants = pixel_shader->constant_register_map();
+      for (uint32_t constant = 0; constant < 256; ++constant) {
+        if (!(constants.float_bitmap[constant / 64] &
+              (UINT64_C(1) << (constant % 64)))) {
+          continue;
+        }
+        const uint32_t register_index =
+            XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * (ps_constants.base + constant);
+        REXGPU_INFO("TRACE_CONSTANT c{}={},{},{},{}", constant,
+                    regs.Get<float>(register_index + 0), regs.Get<float>(register_index + 1),
+                    regs.Get<float>(register_index + 2), regs.Get<float>(register_index + 3));
+      }
+    }
+  }
+
+  std::vector<std::pair<uint64_t, ShaderStats>> sorted_stats(pixel_shader_stats.begin(),
+                                                             pixel_shader_stats.end());
+  std::sort(sorted_stats.begin(), sorted_stats.end(), [](const auto& left, const auto& right) {
+    return left.second.draw_count > right.second.draw_count;
+  });
+  REXGPU_INFO("TRACE_SUMMARY frames={} draws={} pixel_shaders={}", player_->frame_count(),
+              total_draws, sorted_stats.size());
+  for (const auto& [hash, stats] : sorted_stats) {
+    REXGPU_INFO(
+        "TRACE_SHADER ps={:016X} draws={} first={}:{} ucode_dwords={} texture_bindings={}", hash,
+        stats.draw_count, stats.first_frame, stats.first_command, stats.ucode_dwords,
+        stats.texture_bindings);
+  }
+
+  const std::filesystem::path frame_dump_path = REXCVAR_GET(trace_dump_frame);
+  if (!frame_dump_path.empty()) {
+    const TraceReader::Frame* frame = player_->current_frame();
+    player_->SeekCommand(-1);
+    player_->SeekCommand(int(frame->commands.size()) - 1);
+    player_->WaitOnPlayback();
+    if (DumpGuestOutputPPM(graphics_system_->presenter(), frame_dump_path)) {
+      REXGPU_INFO("TRACE_FRAME_DUMP path={}", frame_dump_path.string());
+    } else {
+      REXGPU_ERROR("TRACE_FRAME_DUMP failed path={}", frame_dump_path.string());
+    }
+  }
 }
 
 void TraceViewer::DrawMultilineString(const std::string_view str) {
@@ -789,8 +1314,8 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
   }
   ImGui::BeginChild("#indices", ImVec2(0, 300));
   ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 0));
-  int display_start, display_end;
-  ImGui::CalcListClipping(vertex_count, ImGui::GetTextLineHeight(), &display_start, &display_end);
+  int display_start = 0;
+  int display_end = vertex_count;
   ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
   ImGui::Columns(column_count);
   if (display_start <= 1) {
@@ -870,9 +1395,9 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
         } break;
         case xenos::VertexFormat::k_16_16_FLOAT: {
           auto e0 = LOADEL(uint32_t, 0);
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", Float16ToFloat((e0 >> 16) & 0xFFFF));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", Float16ToFloat((e0 >> 0) & 0xFFFF));
           ImGui::NextColumn();
         } break;
         case xenos::VertexFormat::k_32_32:
@@ -944,13 +1469,13 @@ void TraceViewer::DrawVertexFetcher(Shader* shader, const Shader::VertexBinding&
         case xenos::VertexFormat::k_16_16_16_16_FLOAT: {
           auto e0 = LOADEL(uint32_t, 0);
           auto e1 = LOADEL(uint32_t, 1);
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", Float16ToFloat((e0 >> 16) & 0xFFFF));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e0 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", Float16ToFloat((e0 >> 0) & 0xFFFF));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e1 >> 16) & 0xFFFF));
+          ImGui::Text("%.2f", Float16ToFloat((e1 >> 16) & 0xFFFF));
           ImGui::NextColumn();
-          ImGui::Text("%.2f", half_float::detail::half2float((e1 >> 0) & 0xFFFF));
+          ImGui::Text("%.2f", Float16ToFloat((e1 >> 0) & 0xFFFF));
           ImGui::NextColumn();
         } break;
         case xenos::VertexFormat::k_32_32_32_32_FLOAT:
@@ -1566,9 +2091,8 @@ void TraceViewer::DrawStateUI() {
 
       ImGui::BeginChild("#vsvertices", ImVec2(0, 300));
 
-      int display_start, display_end;
-      ImGui::CalcListClipping(int(vertices.size() / 4), ImGui::GetTextLineHeight(), &display_start,
-                              &display_end);
+      int display_start = 0;
+      int display_end = int(vertices.size() / 4);
       ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
 
       ImGui::Columns(int(el_size), "#vsvertices", true);
@@ -1628,9 +2152,8 @@ void TraceViewer::DrawStateUI() {
       }
       ImGui::BeginChild("#indices", ImVec2(0, 300));
       ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
-      int display_start, display_end;
-      ImGui::CalcListClipping(1 + draw_info.index_count, ImGui::GetTextLineHeight(), &display_start,
-                              &display_end);
+      int display_start = 0;
+      int display_end = 1 + draw_info.index_count;
       ImGui::Dummy(ImVec2(0, (display_start)*ImGui::GetTextLineHeight()));
       ImGui::Columns(2, "#indices", true);
       ImGui::SetColumnOffset(1, 60);
