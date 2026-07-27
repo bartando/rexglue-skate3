@@ -284,10 +284,19 @@ void CommandProcessor::RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ra
 }
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+  bool call_now = false;
+  {
+    std::lock_guard lock(pending_fns_mutex_);
+    if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+      call_now = true;
+    } else {
+      pending_fns_.push(std::move(fn));
+    }
+  }
+  if (call_now) {
     fn();
   } else {
-    pending_fns_.push(std::move(fn));
+    write_ptr_index_event_->Set();
   }
 }
 
@@ -329,10 +338,22 @@ void CommandProcessor::WorkerThreadMain() {
     return;
   }
 
+  auto has_pending_functions = [this]() {
+    std::lock_guard lock(pending_fns_mutex_);
+    return !pending_fns_.empty();
+  };
+
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
+    while (true) {
+      std::function<void()> fn;
+      {
+        std::lock_guard lock(pending_fns_mutex_);
+        if (pending_fns_.empty()) {
+          break;
+        }
+        fn = std::move(pending_fns_.front());
+        pending_fns_.pop();
+      }
       fn();
     }
 
@@ -355,10 +376,10 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ && !has_pending_functions() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || has_pending_functions()) {
         continue;
       }
     }

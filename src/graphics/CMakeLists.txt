@@ -28,6 +28,9 @@ set(REXGRAPHICS_SYSTEM_SOURCES
     packet_disassembler.cpp
     native_guest_renderer.cpp
     primitive_processor.cpp
+    trace_player.cpp
+    trace_reader.cpp
+    trace_viewer.cpp
     pipeline/render_target/cache.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp

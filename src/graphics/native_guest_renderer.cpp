@@ -60,12 +60,21 @@ std::atomic<bool> g_native_output_active{false};
 std::atomic<NativeGuestOutputPostProcessor> g_post_processor{nullptr};
 std::atomic<void*> g_post_processor_user_data{nullptr};
 std::atomic<bool> g_post_process_requested{false};
+std::atomic<NativeGuestDrawMatcher> g_draw_matcher{nullptr};
+std::atomic<NativeGuestDrawRenderer> g_draw_renderer{nullptr};
+std::atomic<void*> g_draw_replacer_user_data{nullptr};
+std::atomic<NativeGuestDrawEligibilityObserver> g_draw_eligibility_observer{
+    nullptr};
+std::atomic<void*> g_draw_eligibility_observer_user_data{nullptr};
 
 }  // namespace
 
 void SetNativeGuestOutputRenderer(NativeGuestOutputRenderer renderer, void* user_data) {
   g_renderer_user_data.store(user_data, std::memory_order_release);
   g_renderer.store(renderer, std::memory_order_release);
+  if (renderer == nullptr) {
+    g_native_output_active.store(false, std::memory_order_relaxed);
+  }
 }
 
 bool TryRenderNativeGuestOutput(const NativeGuestOutputRenderContext& context) {
@@ -109,6 +118,62 @@ void RequestNativeGuestOutputPostProcess(bool requested) {
 
 bool IsNativeGuestOutputPostProcessRequested() {
   return g_post_process_requested.load(std::memory_order_acquire);
+}
+
+void SetNativeGuestDrawReplacer(NativeGuestDrawMatcher matcher,
+                                NativeGuestDrawRenderer renderer,
+                                void* user_data) {
+  g_draw_replacer_user_data.store(user_data, std::memory_order_release);
+  g_draw_renderer.store(renderer, std::memory_order_release);
+  g_draw_matcher.store(matcher, std::memory_order_release);
+}
+
+bool HasNativeGuestDrawReplacer() {
+  return g_draw_matcher.load(std::memory_order_acquire) != nullptr &&
+         g_draw_renderer.load(std::memory_order_acquire) != nullptr;
+}
+
+void SetNativeGuestDrawEligibilityObserver(
+    NativeGuestDrawEligibilityObserver observer, void* user_data) {
+  g_draw_eligibility_observer_user_data.store(user_data,
+                                               std::memory_order_release);
+  g_draw_eligibility_observer.store(observer, std::memory_order_release);
+}
+
+bool HasNativeGuestDrawEligibilityObserver() {
+  return g_draw_eligibility_observer.load(std::memory_order_acquire) !=
+         nullptr;
+}
+
+void ObserveNativeGuestDrawEligibility(
+    const NativeGuestDrawEligibilityContext& context) {
+  NativeGuestDrawEligibilityObserver observer =
+      g_draw_eligibility_observer.load(std::memory_order_acquire);
+  if (observer == nullptr) {
+    return;
+  }
+  observer(context, g_draw_eligibility_observer_user_data.load(
+                        std::memory_order_acquire));
+}
+
+bool MatchesNativeGuestDraw(const NativeGuestDrawContext& context) {
+  NativeGuestDrawMatcher matcher =
+      g_draw_matcher.load(std::memory_order_acquire);
+  if (matcher == nullptr) {
+    return false;
+  }
+  return matcher(
+      context, g_draw_replacer_user_data.load(std::memory_order_acquire));
+}
+
+bool TryReplaceNativeGuestDraw(const NativeGuestDrawContext& context) {
+  NativeGuestDrawRenderer renderer =
+      g_draw_renderer.load(std::memory_order_acquire);
+  if (renderer == nullptr) {
+    return false;
+  }
+  return renderer(
+      context, g_draw_replacer_user_data.load(std::memory_order_acquire));
 }
 
 bool IsNativeGuestOutputActive() {

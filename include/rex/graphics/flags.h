@@ -87,7 +87,7 @@ REXCVAR_DECLARE(std::string, swap_post_effect);
 
 // Vulkan
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
-REXCVAR_DECLARE(bool, vulkan_submit_on_primary_buffer_end);
+REXCVAR_DECLARE(int32_t, vulkan_primary_buffers_per_submission);
 REXCVAR_DECLARE(bool, vulkan_dynamic_rendering);
 REXCVAR_DECLARE(bool, vulkan_async_skip_incomplete_frames);
 REXCVAR_DECLARE(int32_t, vulkan_async_placeholder_max_consecutive_skips);

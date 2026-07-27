@@ -1944,7 +1944,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   // unpacked textures with 32-bit-class host formats only.
   VkPipeline pipeline_storage_dest = VK_NULL_HANDLE;
   VkDescriptorSet descriptor_set_dest_storage = VK_NULL_HANDLE;
-  if (texture_key.scaled_resolve && REXCVAR_GET(vulkan_storage_image_texture_loads)) {
+  if (texture_key.scaled_resolve &&
+      REXCVAR_GET(vulkan_storage_image_texture_loads)) {
     static int storage_dest_fallback_logs_remaining = 8;
     auto log_storage_fallback = [&](const char* reason) {
       if (storage_dest_fallback_logs_remaining > 0) {

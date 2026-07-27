@@ -55,8 +55,7 @@ uint64_t Fnv1a64(const void* data, size_t size, uint64_t hash) {
   return hash;
 }
 
-std::filesystem::path ShaderCachePath(const nrhi::ShaderDesc& desc,
-                                      const char* target) {
+std::filesystem::path ShaderCachePath(const nrhi::ShaderDesc& desc, const char* target) {
   const char* dir = nrhi::GetShaderBytecodeCacheDirectory();
   if (dir == nullptr || dir[0] == '\0') {
     return {};
@@ -81,8 +80,7 @@ std::filesystem::path ShaderCachePath(const nrhi::ShaderDesc& desc,
   }
   feed_str(desc.hlsl_source != nullptr ? desc.hlsl_source : "");
   char name[48];
-  std::snprintf(name, sizeof(name), "%016llx%016llx.dxbc",
-                static_cast<unsigned long long>(h1),
+  std::snprintf(name, sizeof(name), "%016llx%016llx.dxbc", static_cast<unsigned long long>(h1),
                 static_cast<unsigned long long>(h2));
   return std::filesystem::path(dir) / name;
 }
@@ -101,8 +99,7 @@ ID3DBlob* TryLoadCachedBlob(const std::filesystem::path& path) {
     return nullptr;
   }
   f.seekg(0);
-  f.read(static_cast<char*>(blob->GetBufferPointer()),
-         static_cast<std::streamsize>(size));
+  f.read(static_cast<char*>(blob->GetBufferPointer()), static_cast<std::streamsize>(size));
   // The DXBC container magic rejects truncated or foreign files.
   if (!f.good() || std::memcmp(blob->GetBufferPointer(), "DXBC", 4) != 0) {
     blob->Release();
@@ -169,6 +166,10 @@ DXGI_FORMAT ToDxgi(Format format) {
       return DXGI_FORMAT_R32G32B32A32_FLOAT;
     case Format::kD32_FLOAT:
       return DXGI_FORMAT_D32_FLOAT;
+    case Format::kD24_UNORM_S8_UINT:
+      return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    case Format::kD32_FLOAT_S8_UINT:
+      return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     case Format::kBC1_UNORM:
       return DXGI_FORMAT_BC1_UNORM;
     case Format::kBC2_UNORM:
@@ -190,13 +191,18 @@ Format FromDxgi(DXGI_FORMAT format) {
       return Format::kR8G8B8A8_UNORM;
     case DXGI_FORMAT_R10G10B10A2_UNORM:
       return Format::kR10G10B10A2_UNORM;
+    case DXGI_FORMAT_D32_FLOAT:
+      return Format::kD32_FLOAT;
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+      return Format::kD24_UNORM_S8_UINT;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      return Format::kD32_FLOAT_S8_UINT;
     default:
       return Format::kUnknown;
   }
 }
 
-D3D12_RESOURCE_STATES ToStates(ResourceState state,
-                               D3D12_RESOURCE_STATES guest_output_state) {
+D3D12_RESOURCE_STATES ToStates(ResourceState state, D3D12_RESOURCE_STATES guest_output_state) {
   switch (state) {
     case ResourceState::kRenderTarget:
       return D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -284,6 +290,7 @@ class NrTextureD3D12 : public nrhi::Texture {
   uint32_t width() const override { return desc.width; }
   uint32_t height() const override { return desc.height; }
   Format format() const override { return desc.format; }
+  uint32_t sample_count() const override { return desc.sample_count; }
 
   ID3D12Resource* resource = nullptr;
   nrhi::TextureDesc desc;
@@ -364,39 +371,31 @@ class NrCmdD3D12 : public nrhi::Cmd {
   void SetPipeline(nrhi::Pipeline* pipeline) override;
   void SetRootConstants(uint32_t param, uint32_t count, const void* values,
                         uint32_t dest_offset_in_values) override;
-  void SetConstantBuffer(uint32_t param, nrhi::Buffer* buffer,
-                         uint64_t offset) override;
-  void SetBufferSrv(uint32_t param, nrhi::Buffer* buffer,
-                    uint64_t offset) override;
+  void SetConstantBuffer(uint32_t param, nrhi::Buffer* buffer, uint64_t offset) override;
+  void SetBufferSrv(uint32_t param, nrhi::Buffer* buffer, uint64_t offset) override;
   void SetTexture(uint32_t param, nrhi::TextureView* view) override;
-  void SetTexturePair(uint32_t param, nrhi::TextureView* first,
-                      nrhi::TextureView* second) override;
-  void SetTextures(uint32_t param, nrhi::TextureView* const* views,
-                   uint32_t count) override;
+  void SetTexturePair(uint32_t param, nrhi::TextureView* first, nrhi::TextureView* second) override;
+  void SetTextures(uint32_t param, nrhi::TextureView* const* views, uint32_t count) override;
   void SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) override;
   void ClearRenderTarget(nrhi::Texture* color, const float color4[4]) override;
   void ClearDepth(nrhi::Texture* depth, float value) override;
   void SetViewport(const nrhi::Viewport& viewport) override;
   void SetScissor(const nrhi::Rect& rect) override;
-  void SetVertexBuffer(nrhi::Buffer* buffer, uint64_t offset,
-                       uint32_t size_bytes, uint32_t stride) override;
-  void SetIndexBuffer(nrhi::Buffer* buffer, uint64_t offset,
-                      uint32_t size_bytes) override;
+  void SetVertexBuffer(nrhi::Buffer* buffer, uint64_t offset, uint32_t size_bytes,
+                       uint32_t stride) override;
+  void SetIndexBuffer(nrhi::Buffer* buffer, uint64_t offset, uint32_t size_bytes) override;
   void SetPrimitiveTopology(nrhi::PrimitiveTopology topology) override;
+  bool PreflightDraw() override;
   void Draw(uint32_t vertex_count, uint32_t start_vertex) override;
-  void DrawIndexed(uint32_t index_count, uint32_t start_index,
-                   int32_t base_vertex) override;
-  void CopyBufferToTexture(nrhi::Texture* dst, uint32_t mip,
-                           uint32_t array_slice, nrhi::Buffer* src,
-                           uint64_t src_offset, uint32_t row_pitch,
-                           uint32_t width, uint32_t height,
-                           uint32_t depth) override;
-  void CopyTextureToBuffer(nrhi::Buffer* dst, uint64_t dst_offset,
-                           uint32_t row_pitch, nrhi::Texture* src,
-                           uint32_t mip, uint32_t width,
+  void DrawIndexed(uint32_t index_count, uint32_t start_index, int32_t base_vertex) override;
+  bool DrawIndexedChecked(uint32_t index_count, uint32_t start_index, int32_t base_vertex) override;
+  void CopyBufferToTexture(nrhi::Texture* dst, uint32_t mip, uint32_t array_slice,
+                           nrhi::Buffer* src, uint64_t src_offset, uint32_t row_pitch,
+                           uint32_t width, uint32_t height, uint32_t depth) override;
+  void CopyTextureToBuffer(nrhi::Buffer* dst, uint64_t dst_offset, uint32_t row_pitch,
+                           nrhi::Texture* src, uint32_t mip, uint32_t width,
                            uint32_t height) override;
-  void Barrier(nrhi::Texture* texture, ResourceState before,
-               ResourceState after) override;
+  void Barrier(nrhi::Texture* texture, ResourceState before, ResourceState after) override;
   void FlushBarriers() override;
   void ProfileRegion(nrhi::ProfileStage stage) override;
 
@@ -406,6 +405,7 @@ class NrCmdD3D12 : public nrhi::Cmd {
   void ResetFrameState() {
     std::memset(last_table_views_, 0, sizeof(last_table_views_));
     std::memset(last_table_counts_, 0, sizeof(last_table_counts_));
+    bindings_valid_ = true;
   }
 
   // Frame begin only (never on root-signature changes): each frame gets a
@@ -428,9 +428,9 @@ class NrCmdD3D12 : public nrhi::Cmd {
   // same views (shadow atlas, cube map, white fallback), skipping both the
   // binding-cache lookup and the root-table re-record. A zero count is the
   // empty/invalid state; real bindings always have count >= 1.
-  NrTextureViewD3D12* last_table_views_[nrhi::kMaxBindingParams]
-                                       [nrhi::kMaxTextureTableSize] = {};
+  NrTextureViewD3D12* last_table_views_[nrhi::kMaxBindingParams][nrhi::kMaxTextureTableSize] = {};
   uint32_t last_table_counts_[nrhi::kMaxBindingParams] = {};
+  bool bindings_valid_ = true;
 };
 
 class NrDeviceD3D12 : public nrhi::Device {
@@ -455,8 +455,7 @@ class NrDeviceD3D12 : public nrhi::Device {
     heap_desc.NumDescriptors = kDsvSlots;
     device_->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&dsv_heap_));
 
-    view_size_ =
-        device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    view_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     rtv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     dsv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
     staging_slots_.capacity = kStagingViews;
@@ -469,10 +468,8 @@ class NrDeviceD3D12 : public nrhi::Device {
     // step fails.
     IDXGIFactory4* factory4 = nullptr;
     IDXGIFactory2* factory = provider.GetDXGIFactory();
-    if (factory != nullptr &&
-        SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory4)))) {
-      factory4->EnumAdapterByLuid(device_->GetAdapterLuid(),
-                                  IID_PPV_ARGS(&adapter3_));
+    if (factory != nullptr && SUCCEEDED(factory->QueryInterface(IID_PPV_ARGS(&factory4)))) {
+      factory4->EnumAdapterByLuid(device_->GetAdapterLuid(), IID_PPV_ARGS(&adapter3_));
       factory4->Release();
     }
     release_thread_ = std::thread([this] { ReleaseThreadMain(); });
@@ -502,10 +499,14 @@ class NrDeviceD3D12 : public nrhi::Device {
       entry.second->resource->Release();
       delete entry.second;
     }
-    if (staging_heap_) staging_heap_->Release();
-    if (srv_heap_) srv_heap_->Release();
-    if (rtv_heap_) rtv_heap_->Release();
-    if (dsv_heap_) dsv_heap_->Release();
+    if (staging_heap_)
+      staging_heap_->Release();
+    if (srv_heap_)
+      srv_heap_->Release();
+    if (rtv_heap_)
+      rtv_heap_->Release();
+    if (dsv_heap_)
+      dsv_heap_->Release();
   }
 
   Backend backend() const override { return Backend::kD3D12; }
@@ -549,8 +550,9 @@ class NrDeviceD3D12 : public nrhi::Device {
                                                  : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.Width = desc.width;
     rd.Height = desc.height;
-    rd.DepthOrArraySize =
-        UINT16(desc.kind == TextureKind::kCube ? 6 : desc.kind == TextureKind::k3D ? desc.depth : 1);
+    rd.DepthOrArraySize = UINT16(desc.kind == TextureKind::kCube ? 6
+                                 : desc.kind == TextureKind::k3D ? desc.depth
+                                                                 : 1);
     rd.MipLevels = UINT16(desc.mip_levels);
     rd.Format = ToDxgi(desc.format);
     rd.SampleDesc.Count = desc.sample_count;
@@ -564,25 +566,28 @@ class NrDeviceD3D12 : public nrhi::Device {
       clear_ptr = &clear;
     }
     if (desc.usage & nrhi::kTextureUsageDepthStencil) {
-      // The depth resource is created typeless and viewed as D32_FLOAT /
-      // R32_FLOAT; a typed depth SRV read the clear value on some drivers
-      // (the photo-editor DoF smear); preserve the proven arrangement.
+      // Depth resources are created typeless so they may be viewed through
+      // both the matching DSV and a shader-readable depth SRV.
       rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
       if (desc.format == Format::kD32_FLOAT) {
         rd.Format = DXGI_FORMAT_R32_TYPELESS;
+      } else if (desc.format == Format::kD24_UNORM_S8_UINT) {
+        rd.Format = DXGI_FORMAT_R24G8_TYPELESS;
+      } else if (desc.format == Format::kD32_FLOAT_S8_UINT) {
+        rd.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
       }
-      clear.Format = DXGI_FORMAT_D32_FLOAT;
+      clear.Format = ToDxgi(desc.format);
       clear.DepthStencil.Depth = desc.clear_depth;
       clear_ptr = &clear;
     }
     ID3D12Resource* resource = nullptr;
-    if (FAILED(device_->CreateCommittedResource(
-            &ui::d3d12::util::kHeapPropertiesDefault,
-            cp_->GetD3D12Provider().GetHeapFlagCreateNotZeroed(), &rd,
-            ToStates(desc.initial_state, guest_output_state_), clear_ptr,
-            IID_PPV_ARGS(&resource)))) {
-      REXLOG_ERROR("nrhi-d3d12: texture creation failed ({}x{} fmt {})", desc.width,
-                   desc.height, uint32_t(desc.format));
+    if (FAILED(
+            device_->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                             cp_->GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+                                             &rd, ToStates(desc.initial_state, guest_output_state_),
+                                             clear_ptr, IID_PPV_ARGS(&resource)))) {
+      REXLOG_ERROR("nrhi-d3d12: texture creation failed ({}x{} fmt {})", desc.width, desc.height,
+                   uint32_t(desc.format));
       return nullptr;
     }
     auto* texture = new NrTextureD3D12();
@@ -599,9 +604,9 @@ class NrDeviceD3D12 : public nrhi::Device {
       std::lock_guard<std::mutex> lock(mutex_);
       if (dsv_slots_.Alloc(1, &texture->dsv_slot)) {
         D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
-        dsv.Format = DXGI_FORMAT_D32_FLOAT;
-        dsv.ViewDimension = desc.sample_count > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS
-                                                  : D3D12_DSV_DIMENSION_TEXTURE2D;
+        dsv.Format = ToDxgi(desc.format);
+        dsv.ViewDimension =
+            desc.sample_count > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
         device_->CreateDepthStencilView(resource, &dsv, DsvHandle(texture->dsv_slot));
       }
     }
@@ -630,7 +635,8 @@ class NrDeviceD3D12 : public nrhi::Device {
   void InvalidateForRead(nrhi::Buffer*, uint64_t, uint64_t) override {}
 
   void DestroyDeferred(nrhi::Buffer* buffer) override {
-    if (buffer == nullptr) return;
+    if (buffer == nullptr)
+      return;
     auto* b = static_cast<NrBufferD3D12*>(buffer);
     std::lock_guard<std::mutex> lock(mutex_);
     retired_.emplace_back(RetiredObject{b->resource, nullptr, cp_->GetCurrentSubmission()});
@@ -638,18 +644,22 @@ class NrDeviceD3D12 : public nrhi::Device {
   }
 
   void DestroyDeferred(nrhi::Texture* texture) override {
-    if (texture == nullptr) return;
+    if (texture == nullptr)
+      return;
     auto* t = static_cast<NrTextureD3D12*>(texture);
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t submission = cp_->GetCurrentSubmission();
-    if (t->rtv_slot != ~0u) rtv_slots_.Retire(t->rtv_slot, 1, submission);
-    if (t->dsv_slot != ~0u) dsv_slots_.Retire(t->dsv_slot, 1, submission);
+    if (t->rtv_slot != ~0u)
+      rtv_slots_.Retire(t->rtv_slot, 1, submission);
+    if (t->dsv_slot != ~0u)
+      dsv_slots_.Retire(t->dsv_slot, 1, submission);
     retired_.emplace_back(RetiredObject{t->resource, nullptr, submission});
     delete t;
   }
 
   void DestroyDeferred(nrhi::TextureView* view) override {
-    if (view == nullptr) return;
+    if (view == nullptr)
+      return;
     // Destruction is batched: the view object stays allocated (so its
     // address cannot be reused while stale binding-cache keys still hold it)
     // and FlushDissolvedViews sweeps the binding cache ONCE per frame for
@@ -661,7 +671,8 @@ class NrDeviceD3D12 : public nrhi::Device {
   // shader-visible binding referencing a view destroyed since the last
   // flush, then retire the views themselves.
   void FlushDissolvedViews() {
-    if (dissolved_views_.empty()) return;
+    if (dissolved_views_.empty())
+      return;
     std::unordered_set<const NrTextureViewD3D12*> dissolved(dissolved_views_.begin(),
                                                             dissolved_views_.end());
     std::lock_guard<std::mutex> lock(mutex_);
@@ -683,7 +694,8 @@ class NrDeviceD3D12 : public nrhi::Device {
   }
 
   void DestroyDeferred(nrhi::Pipeline* pipeline) override {
-    if (pipeline == nullptr) return;
+    if (pipeline == nullptr)
+      return;
     auto* p = static_cast<NrPipelineD3D12*>(pipeline);
     std::lock_guard<std::mutex> lock(mutex_);
     retired_.emplace_back(RetiredObject{nullptr, p->pso, cp_->GetCurrentSubmission()});
@@ -691,9 +703,11 @@ class NrDeviceD3D12 : public nrhi::Device {
   }
 
   void DestroyDeferred(nrhi::Shader* shader) override {
-    if (shader == nullptr) return;
+    if (shader == nullptr)
+      return;
     auto* s = static_cast<NrShaderD3D12*>(shader);
-    if (s->blob) s->blob->Release();
+    if (s->blob)
+      s->blob->Release();
     delete s;
   }
 
@@ -709,15 +723,20 @@ class NrDeviceD3D12 : public nrhi::Device {
       }
     }
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = desc.format != Format::kUnknown ? ToDxgi(desc.format)
-                 : t->desc.format == Format::kD32_FLOAT ? DXGI_FORMAT_R32_FLOAT
-                                                        : t->dxgi_format;
+    const Format view_format = desc.format != Format::kUnknown ? desc.format : t->desc.format;
+    srv.Format = ToDxgi(view_format);
+    if (view_format == Format::kD32_FLOAT) {
+      srv.Format = DXGI_FORMAT_R32_FLOAT;
+    } else if (view_format == Format::kD24_UNORM_S8_UINT) {
+      srv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    } else if (view_format == Format::kD32_FLOAT_S8_UINT) {
+      srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    }
     srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
         ToShaderComponentMapping(desc.swizzle[0]), ToShaderComponentMapping(desc.swizzle[1]),
         ToShaderComponentMapping(desc.swizzle[2]), ToShaderComponentMapping(desc.swizzle[3]));
-    const uint32_t mips = desc.mip_levels == ~0u
-                              ? (t->desc.mip_levels - desc.base_mip)
-                              : desc.mip_levels;
+    const uint32_t mips =
+        desc.mip_levels == ~0u ? (t->desc.mip_levels - desc.base_mip) : desc.mip_levels;
     switch (desc.dimension) {
       case nrhi::ViewDimension::k2DMS:
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
@@ -784,9 +803,8 @@ class NrDeviceD3D12 : public nrhi::Device {
     for (uint32_t i = 0; i < desc.static_sampler_count; ++i) {
       const nrhi::StaticSamplerDesc& s = desc.static_samplers[i];
       samplers[i].Filter = s.filter == nrhi::Filter::kAnisotropic ? D3D12_FILTER_ANISOTROPIC
-                           : s.filter == nrhi::Filter::kLinear
-                               ? D3D12_FILTER_MIN_MAG_MIP_LINEAR
-                               : D3D12_FILTER_MIN_MAG_MIP_POINT;
+                           : s.filter == nrhi::Filter::kLinear    ? D3D12_FILTER_MIN_MAG_MIP_LINEAR
+                                                                  : D3D12_FILTER_MIN_MAG_MIP_POINT;
       samplers[i].MaxAnisotropy = s.max_anisotropy;
       D3D12_TEXTURE_ADDRESS_MODE mode = s.address == nrhi::AddressMode::kWrap
                                             ? D3D12_TEXTURE_ADDRESS_MODE_WRAP
@@ -803,8 +821,9 @@ class NrDeviceD3D12 : public nrhi::Device {
     rs.pParameters = params;
     rs.NumStaticSamplers = desc.static_sampler_count;
     rs.pStaticSamplers = samplers;
-    rs.Flags = desc.allow_input_layout ? D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-                                       : D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    rs.Flags = desc.allow_input_layout
+                   ? D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+                   : D3D12_ROOT_SIGNATURE_FLAG_NONE;
     ID3D12RootSignature* root_signature =
         ui::d3d12::util::CreateRootSignature(cp_->GetD3D12Provider(), rs);
     if (root_signature == nullptr) {
@@ -841,19 +860,20 @@ class NrDeviceD3D12 : public nrhi::Device {
                      desc.name != nullptr ? desc.name : "?", desc.entry_point,
                      errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer())
                                        : "no error blob");
-        if (errors) errors->Release();
+        if (errors)
+          errors->Release();
         return nullptr;
       }
-      if (errors) errors->Release();
+      if (errors)
+        errors->Release();
       const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::steady_clock::now() - compile_start)
                                   .count();
       if (!cache_path.empty()) {
         StoreCachedBlob(cache_path, blob);
       }
-      REXLOG_INFO("nrhi-d3d12: compiled {} {} in {} ms{}",
-                  desc.name != nullptr ? desc.name : "?", desc.entry_point, compile_ms,
-                  cache_path.empty() ? "" : " (cached to disk)");
+      REXLOG_INFO("nrhi-d3d12: compiled {} {} in {} ms{}", desc.name != nullptr ? desc.name : "?",
+                  desc.entry_point, compile_ms, cache_path.empty() ? "" : " (cached to disk)");
     }
     auto* shader = new NrShaderD3D12();
     shader->blob = blob;
@@ -864,11 +884,13 @@ class NrDeviceD3D12 : public nrhi::Device {
     auto* layout = static_cast<NrBindingLayoutD3D12*>(desc.layout);
     auto* vs = static_cast<NrShaderD3D12*>(desc.vs);
     auto* ps = static_cast<NrShaderD3D12*>(desc.ps);
-    if (layout == nullptr || vs == nullptr || ps == nullptr) return nullptr;
+    if (layout == nullptr || vs == nullptr || ps == nullptr)
+      return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = layout->root_signature;
     pd.VS = {vs->blob->GetBufferPointer(), vs->blob->GetBufferSize()};
     pd.PS = {ps->blob->GetBufferPointer(), ps->blob->GetBufferSize()};
+    pd.BlendState.AlphaToCoverageEnable = desc.blend.alpha_to_coverage;
     pd.BlendState.RenderTarget[0].BlendEnable = desc.blend.enable;
     pd.BlendState.RenderTarget[0].SrcBlend = ToBlend(desc.blend.src);
     pd.BlendState.RenderTarget[0].DestBlend = ToBlend(desc.blend.dst);
@@ -879,14 +901,14 @@ class NrDeviceD3D12 : public nrhi::Device {
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = desc.blend.write_mask;
     pd.SampleMask = UINT_MAX;
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pd.RasterizerState.CullMode = desc.cull == nrhi::CullMode::kFront ? D3D12_CULL_MODE_FRONT
+    pd.RasterizerState.CullMode = desc.cull == nrhi::CullMode::kFront  ? D3D12_CULL_MODE_FRONT
                                   : desc.cull == nrhi::CullMode::kBack ? D3D12_CULL_MODE_BACK
                                                                        : D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.FrontCounterClockwise = !desc.front_face_clockwise;
     pd.RasterizerState.DepthClipEnable = desc.depth_clip;
     pd.DepthStencilState.DepthEnable = desc.depth.test_enable;
-    pd.DepthStencilState.DepthWriteMask = desc.depth.write_enable
-                                              ? D3D12_DEPTH_WRITE_MASK_ALL
-                                              : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthWriteMask =
+        desc.depth.write_enable ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc = ToCompare(desc.depth.func);
     D3D12_INPUT_ELEMENT_DESC elements[16] = {};
     if (desc.input_elements != nullptr && desc.input_element_count != 0 &&
@@ -928,8 +950,8 @@ class NrDeviceD3D12 : public nrhi::Device {
       D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{};
       levels.Format = dxgi;
       levels.SampleCount = count;
-      if (SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-                                                 &levels, sizeof(levels))) &&
+      if (SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &levels,
+                                                 sizeof(levels))) &&
           levels.NumQualityLevels > 0) {
         break;
       }
@@ -967,15 +989,14 @@ class NrDeviceD3D12 : public nrhi::Device {
     if (adapter3_ != nullptr && (frame_index_ % 600) == 0) {
       DXGI_QUERY_VIDEO_MEMORY_INFO local{};
       DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal{};
-      if (SUCCEEDED(adapter3_->QueryVideoMemoryInfo(
-              0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
-          SUCCEEDED(adapter3_->QueryVideoMemoryInfo(
-              0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))) {
+      if (SUCCEEDED(adapter3_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+          SUCCEEDED(
+              adapter3_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal))) {
         REXLOG_INFO(
             "nrhi-d3d12 mem: local use={}MB budget={}MB | nonlocal use={}MB "
             "budget={}MB | retired={}",
-            local.CurrentUsage >> 20, local.Budget >> 20,
-            nonlocal.CurrentUsage >> 20, nonlocal.Budget >> 20, backlog);
+            local.CurrentUsage >> 20, local.Budget >> 20, nonlocal.CurrentUsage >> 20,
+            nonlocal.Budget >> 20, backlog);
       }
     }
     // Frame-maintenance attribution (this work runs outside the app's
@@ -1000,8 +1021,7 @@ class NrDeviceD3D12 : public nrhi::Device {
       }
     }
     NrTextureD3D12*& wrapper = guest_outputs_[guest_output_resource];
-    if (wrapper != nullptr &&
-        (wrapper->desc.width != width || wrapper->desc.height != height)) {
+    if (wrapper != nullptr && (wrapper->desc.width != width || wrapper->desc.height != height)) {
       // Same resource pointer, different geometry: a recreated image reusing
       // the address. Retire the stale wrapper's views and slots.
       DestroyGuestOutputWrapper(wrapper);
@@ -1042,8 +1062,7 @@ class NrDeviceD3D12 : public nrhi::Device {
   // --- internals shared with NrCmdD3D12 ---
 
   D3D12_CPU_DESCRIPTOR_HANDLE StagingHandle(uint32_t slot) const {
-    D3D12_CPU_DESCRIPTOR_HANDLE handle =
-        staging_heap_->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = staging_heap_->GetCPUDescriptorHandleForHeapStart();
     handle.ptr += size_t(slot) * view_size_;
     return handle;
   }
@@ -1092,7 +1111,8 @@ class NrDeviceD3D12 : public nrhi::Device {
         }
       }
       for (uint32_t i = 0; i < count; ++i) {
-        if (views[i] == nullptr) continue;
+        if (views[i] == nullptr)
+          continue;
         device_->CopyDescriptorsSimple(1, SrvCpuHandle(first_slot + i),
                                        StagingHandle(views[i]->staging_slot),
                                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1122,9 +1142,11 @@ class NrDeviceD3D12 : public nrhi::Device {
     NrTextureViewD3D12* views[nrhi::kMaxTextureTableSize];
     uint32_t count;
     bool operator<(const BindingKey& other) const {
-      if (count != other.count) return count < other.count;
+      if (count != other.count)
+        return count < other.count;
       for (uint32_t i = 0; i < count; ++i) {
-        if (views[i] != other.views[i]) return views[i] < other.views[i];
+        if (views[i] != other.views[i])
+          return views[i] < other.views[i];
       }
       return false;
     }
@@ -1173,8 +1195,10 @@ class NrDeviceD3D12 : public nrhi::Device {
         batch.swap(release_queue_);
       }
       for (const RetiredObject& r : batch) {
-        if (r.resource) r.resource->Release();
-        if (r.pso) r.pso->Release();
+        if (r.resource)
+          r.resource->Release();
+        if (r.pso)
+          r.pso->Release();
       }
       batch.clear();
     }
@@ -1182,7 +1206,8 @@ class NrDeviceD3D12 : public nrhi::Device {
 
   void DestroyGuestOutputWrapperLocked(NrTextureD3D12* wrapper) {
     const uint64_t submission = cp_->GetCurrentSubmission();
-    if (wrapper->rtv_slot != ~0u) rtv_slots_.Retire(wrapper->rtv_slot, 1, submission);
+    if (wrapper->rtv_slot != ~0u)
+      rtv_slots_.Retire(wrapper->rtv_slot, 1, submission);
     retired_.emplace_back(RetiredObject{wrapper->resource, nullptr, submission});
     delete wrapper;
   }
@@ -1247,8 +1272,8 @@ void NrCmdD3D12::SetPipeline(nrhi::Pipeline* pipeline) {
 
 void NrCmdD3D12::SetRootConstants(uint32_t param, uint32_t count, const void* values,
                                   uint32_t dest_offset_in_values) {
-  device->cp()->GetDeferredCommandList().D3DSetGraphicsRoot32BitConstants(
-      param, count, values, dest_offset_in_values);
+  device->cp()->GetDeferredCommandList().D3DSetGraphicsRoot32BitConstants(param, count, values,
+                                                                          dest_offset_in_values);
 }
 
 void NrCmdD3D12::SetConstantBuffer(uint32_t param, nrhi::Buffer* buffer, uint64_t offset) {
@@ -1263,7 +1288,11 @@ void NrCmdD3D12::SetBufferSrv(uint32_t param, nrhi::Buffer* buffer, uint64_t off
 
 void NrCmdD3D12::BindTextureTable(uint32_t param, NrTextureViewD3D12* const* views,
                                   uint32_t count) {
-  if (param >= nrhi::kMaxBindingParams) return;
+  if (param >= nrhi::kMaxBindingParams || count == 0 ||
+      count > nrhi::kMaxTextureTableSize) {
+    bindings_valid_ = false;
+    return;
+  }
   if (count == last_table_counts_[param] &&
       std::memcmp(last_table_views_[param], views, count * sizeof(views[0])) == 0) {
     return;  // identical tuple already bound on this root param
@@ -1273,6 +1302,8 @@ void NrCmdD3D12::BindTextureTable(uint32_t param, NrTextureViewD3D12* const* vie
     device->cp()->GetDeferredCommandList().D3DSetGraphicsRootDescriptorTable(param, handle);
     std::memcpy(last_table_views_[param], views, count * sizeof(views[0]));
     last_table_counts_[param] = count;
+  } else {
+    bindings_valid_ = false;
   }
 }
 
@@ -1290,7 +1321,10 @@ void NrCmdD3D12::SetTexturePair(uint32_t param, nrhi::TextureView* first,
 
 void NrCmdD3D12::SetTextures(uint32_t param, nrhi::TextureView* const* views, uint32_t count) {
   NrTextureViewD3D12* typed[nrhi::kMaxTextureTableSize] = {};
-  if (count > nrhi::kMaxTextureTableSize) return;
+  if (count > nrhi::kMaxTextureTableSize) {
+    bindings_valid_ = false;
+    return;
+  }
   for (uint32_t i = 0; i < count; ++i) {
     typed[i] = static_cast<NrTextureViewD3D12*>(views[i]);
   }
@@ -1312,8 +1346,7 @@ void NrCmdD3D12::SetRenderTargets(nrhi::Texture* color, nrhi::Texture* depth) {
     dsv = device->DsvHandle(static_cast<NrTextureD3D12*>(depth)->dsv_slot);
     dsv_ptr = &dsv;
   }
-  device->cp()->GetDeferredCommandList().D3DOMSetRenderTargets(num_rtvs, rtv_ptr, FALSE,
-                                                               dsv_ptr);
+  device->cp()->GetDeferredCommandList().D3DOMSetRenderTargets(num_rtvs, rtv_ptr, FALSE, dsv_ptr);
 }
 
 void NrCmdD3D12::ClearRenderTarget(nrhi::Texture* color, const float color4[4]) {
@@ -1323,8 +1356,8 @@ void NrCmdD3D12::ClearRenderTarget(nrhi::Texture* color, const float color4[4]) 
 
 void NrCmdD3D12::ClearDepth(nrhi::Texture* depth, float value) {
   device->cp()->GetDeferredCommandList().D3DClearDepthStencilView(
-      device->DsvHandle(static_cast<NrTextureD3D12*>(depth)->dsv_slot),
-      D3D12_CLEAR_FLAG_DEPTH, value, 0, 0, nullptr);
+      device->DsvHandle(static_cast<NrTextureD3D12*>(depth)->dsv_slot), D3D12_CLEAR_FLAG_DEPTH,
+      value, 0, 0, nullptr);
 }
 
 void NrCmdD3D12::SetViewport(const nrhi::Viewport& viewport) {
@@ -1370,6 +1403,13 @@ void NrCmdD3D12::SetPrimitiveTopology(nrhi::PrimitiveTopology topology) {
                                                           : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
 
+bool NrCmdD3D12::PreflightDraw() {
+  // D3D12 creates pipelines and records root state eagerly. Texture-table
+  // allocation is the only fallible draw-state step, and BindTextureTable
+  // latches any failure until the next root-signature bind.
+  return bindings_valid_;
+}
+
 void NrCmdD3D12::Draw(uint32_t vertex_count, uint32_t start_vertex) {
   device->cp()->GetDeferredCommandList().D3DDrawInstanced(vertex_count, 1, start_vertex, 0);
 }
@@ -1377,6 +1417,15 @@ void NrCmdD3D12::Draw(uint32_t vertex_count, uint32_t start_vertex) {
 void NrCmdD3D12::DrawIndexed(uint32_t index_count, uint32_t start_index, int32_t base_vertex) {
   device->cp()->GetDeferredCommandList().D3DDrawIndexedInstanced(index_count, 1, start_index,
                                                                  base_vertex, 0);
+}
+
+bool NrCmdD3D12::DrawIndexedChecked(uint32_t index_count, uint32_t start_index,
+                                    int32_t base_vertex) {
+  if (!PreflightDraw()) {
+    return false;
+  }
+  DrawIndexed(index_count, start_index, base_vertex);
+  return true;
 }
 
 void NrCmdD3D12::CopyBufferToTexture(nrhi::Texture* dst, uint32_t mip, uint32_t array_slice,
@@ -1396,8 +1445,7 @@ void NrCmdD3D12::CopyBufferToTexture(nrhi::Texture* dst, uint32_t mip, uint32_t 
   src_loc.PlacedFootprint.Footprint.Height = height;
   src_loc.PlacedFootprint.Footprint.Depth = depth;
   src_loc.PlacedFootprint.Footprint.RowPitch = row_pitch;
-  device->cp()->GetDeferredCommandList().D3DCopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc,
-                                                              nullptr);
+  device->cp()->GetDeferredCommandList().D3DCopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
 }
 
 void NrCmdD3D12::CopyTextureToBuffer(nrhi::Buffer* dst, uint64_t dst_offset, uint32_t row_pitch,
@@ -1417,18 +1465,18 @@ void NrCmdD3D12::CopyTextureToBuffer(nrhi::Buffer* dst, uint64_t dst_offset, uin
   dst_loc.PlacedFootprint.Footprint.Height = height;
   dst_loc.PlacedFootprint.Footprint.Depth = 1;
   dst_loc.PlacedFootprint.Footprint.RowPitch = row_pitch;
-  device->cp()->GetDeferredCommandList().D3DCopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc,
-                                                              nullptr);
+  device->cp()->GetDeferredCommandList().D3DCopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
 }
 
 void NrCmdD3D12::Barrier(nrhi::Texture* texture, ResourceState before, ResourceState after) {
   auto* t = static_cast<NrTextureD3D12*>(texture);
-  device->cp()->PushTransitionBarrier(t->resource,
-                                      ToStates(before, device->guest_output_state()),
+  device->cp()->PushTransitionBarrier(t->resource, ToStates(before, device->guest_output_state()),
                                       ToStates(after, device->guest_output_state()));
 }
 
-void NrCmdD3D12::FlushBarriers() { device->cp()->SubmitBarriers(); }
+void NrCmdD3D12::FlushBarriers() {
+  device->cp()->SubmitBarriers();
+}
 
 rex::perf::DrawBucket ProfileStageBucket(nrhi::ProfileStage stage) {
   switch (stage) {
@@ -1485,9 +1533,9 @@ nrhi::Cmd* NativeRhiBeginFrame(nrhi::Device* device, ID3D12Resource* guest_outpu
                                DXGI_FORMAT guest_output_format,
                                D3D12_RESOURCE_STATES guest_output_internal_state, uint32_t width,
                                uint32_t height, nrhi::Texture** guest_output_out) {
-  return static_cast<NrDeviceD3D12*>(device)->BeginFrame(
-      guest_output_resource, guest_output_format, guest_output_internal_state, width, height,
-      guest_output_out);
+  return static_cast<NrDeviceD3D12*>(device)->BeginFrame(guest_output_resource, guest_output_format,
+                                                         guest_output_internal_state, width, height,
+                                                         guest_output_out);
 }
 
 }  // namespace rex::graphics::d3d12

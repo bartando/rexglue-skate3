@@ -267,6 +267,7 @@ class CommandProcessor {
   system::object_ref<system::XHostThread> worker_thread_;
 
   std::queue<std::function<void()>> pending_fns_;
+  std::mutex pending_fns_mutex_;
 
   // MicroEngine binary from PM4_ME_INIT
   std::vector<uint32_t> me_bin_;

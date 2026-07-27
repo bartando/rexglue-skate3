@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <spirv-tools/libspirv.hpp>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -59,6 +60,12 @@ REXCVAR_DEFINE_INT32(
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(vulkan_shader_probe, "", "GPU/Vulkan",
+                     "Pixel shader hash whose output should be replaced for diagnosis")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(vulkan_shader_probe_mode, "constant", "GPU/Vulkan",
+                     "Probe output: constant, texture0, texture2, or interpolator0")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -71,6 +78,45 @@ void main() {
   discard;
 }
 )";
+
+std::string GetShaderProbeSource(std::string_view mode) {
+  constexpr std::string_view kHeader = R"(#version 460
+layout(location = 0) in vec4 xe_in_interpolator_0;
+layout(location = 0) out vec4 xe_out_fragment_data_0;
+)";
+  std::string source(kHeader);
+  if (mode == "constant") {
+    source += R"(
+void main() {
+  xe_out_fragment_data_0 = vec4(1.0, 0.0, 1.0, 1.0);
+}
+)";
+  } else if (mode == "texture0" || mode == "texture2") {
+    const bool normal_map = mode == "texture2";
+    const uint32_t texture_binding = normal_map ? 2 : 0;
+    const uint32_t sampler_binding = normal_map ? 15 : 14;
+    source += fmt::format(R"(
+layout(set = 3, binding = {}) uniform texture2D xe_probe_texture;
+layout(set = 3, binding = {}) uniform sampler xe_probe_sampler;
+void main() {{
+  vec2 dimensions = vec2(textureSize(sampler2D(xe_probe_texture, xe_probe_sampler), 0));
+  vec2 coordinates = xe_in_interpolator_0.xy + vec2(0.75) / dimensions;
+  xe_out_fragment_data_0 =
+      texture(sampler2D(xe_probe_texture, xe_probe_sampler), coordinates);
+}}
+)",
+                          texture_binding, sampler_binding);
+  } else if (mode == "interpolator0") {
+    source += R"(
+void main() {
+  xe_out_fragment_data_0 = vec4(fract(xe_in_interpolator_0.xy), 0.0, 1.0);
+}
+)";
+  } else {
+    return {};
+  }
+  return source;
+}
 
 constexpr bool IsTriangleDomainHostVertexShaderType(
     Shader::HostVertexShaderType host_vertex_shader_type) {
@@ -357,6 +403,47 @@ bool VulkanPipelineCache::Initialize() {
     REXGPU_WARN(
         "VulkanPipelineCache: Failed to create placeholder pixel shader - "
         "async placeholder hot-swap will be unavailable");
+  }
+
+  const std::string& shader_probe_hash = REXCVAR_GET(vulkan_shader_probe);
+  if (!shader_probe_hash.empty()) {
+    try {
+      shader_probe_pixel_shader_hash_ =
+          std::stoull(shader_probe_hash, nullptr, 16);
+    } catch (...) {
+      REXGPU_ERROR("VulkanPipelineCache: Invalid shader probe hash: {}",
+                   shader_probe_hash);
+      return false;
+    }
+    const std::string& shader_probe_mode =
+        REXCVAR_GET(vulkan_shader_probe_mode);
+    const std::string shader_probe_source =
+        GetShaderProbeSource(shader_probe_mode);
+    if (shader_probe_source.empty()) {
+      REXGPU_ERROR("VulkanPipelineCache: Invalid shader probe mode: {}",
+                   shader_probe_mode);
+      return false;
+    }
+    std::vector<uint32_t> shader_probe_spirv;
+    std::string shader_probe_compile_error;
+    if (!command_processor_.CompileGlslToSpirv(
+            VK_SHADER_STAGE_FRAGMENT_BIT, shader_probe_source,
+            shader_probe_spirv, shader_probe_compile_error)) {
+      REXGPU_ERROR("VulkanPipelineCache: Failed to compile {} shader probe: {}",
+                   shader_probe_mode, shader_probe_compile_error);
+      return false;
+    }
+    shader_probe_pixel_shader_ = ui::vulkan::util::CreateShaderModule(
+        vulkan_device, shader_probe_spirv.data(),
+        shader_probe_spirv.size() * sizeof(uint32_t));
+    if (shader_probe_pixel_shader_ == VK_NULL_HANDLE) {
+      REXGPU_ERROR("VulkanPipelineCache: Failed to create {} shader probe",
+                   shader_probe_mode);
+      return false;
+    }
+    REXGPU_INFO(
+        "VulkanPipelineCache: Probing pixel shader {:016X} with {} output",
+        shader_probe_pixel_shader_hash_, shader_probe_mode);
   }
 
   uint32_t logical_processor_count = rex::thread::logical_processor_count();
@@ -844,6 +931,9 @@ void VulkanPipelineCache::Shutdown() {
                                          depth_float24_round_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          placeholder_pixel_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         shader_probe_pixel_shader_);
+  shader_probe_pixel_shader_hash_ = 0;
   if (tessellation_indexed_vertex_shader_ != VK_NULL_HANDLE) {
     dfn.vkDestroyShaderModule(device, tessellation_indexed_vertex_shader_, nullptr);
     tessellation_indexed_vertex_shader_ = VK_NULL_HANDLE;
@@ -1245,6 +1335,32 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   }
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
+  }
+
+  if (!REXCVAR_GET(dump_shaders).empty()) {
+    const std::vector<uint8_t>& binary = translation.translated_binary();
+    if (translation.host_disassembly().empty() &&
+        binary.size() % sizeof(uint32_t) == 0) {
+      spvtools::SpirvTools spirv_tools(SPV_ENV_VULKAN_1_2);
+      std::string disassembly;
+      const uint32_t disassembly_options =
+          uint32_t(spvtools::SpirvTools::kDefaultDisassembleOption) |
+          uint32_t(SPV_BINARY_TO_TEXT_OPTION_INDENT) |
+          uint32_t(SPV_BINARY_TO_TEXT_OPTION_COMMENT);
+      if (spirv_tools.Disassemble(
+              reinterpret_cast<const uint32_t*>(binary.data()),
+              binary.size() / sizeof(uint32_t), &disassembly,
+              disassembly_options)) {
+        translation.set_host_disassembly(std::move(disassembly));
+      } else {
+        REXGPU_WARN("Failed to disassemble Vulkan shader {:016X} translation {:016X}",
+                    shader.ucode_data_hash(), translation.modification());
+      }
+    }
+    const auto dumped_paths = translation.Dump(REXCVAR_GET(dump_shaders), "spirv");
+    REXGPU_INFO("Dumped Vulkan shader {:016X} translation {:016X} to {}",
+                shader.ucode_data_hash(), translation.modification(),
+                dumped_paths.first.string());
   }
 
   // TODO(Triang3l): Log that the shader has been successfully translated in
@@ -3133,7 +3249,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     if (!creation_arguments.pixel_shader->is_valid()) {
       return false;
     }
-    shader_stage_fragment.module = creation_arguments.pixel_shader->shader_module();
+    shader_stage_fragment.module =
+        shader_probe_pixel_shader_ != VK_NULL_HANDLE &&
+                creation_arguments.pixel_shader->shader().ucode_data_hash() ==
+                    shader_probe_pixel_shader_hash_
+            ? shader_probe_pixel_shader_
+            : creation_arguments.pixel_shader->shader_module();
     assert_true(shader_stage_fragment.module != VK_NULL_HANDLE);
   } else {
     if (edram_fragment_shader_interlock) {

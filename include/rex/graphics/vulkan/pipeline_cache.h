@@ -416,6 +416,8 @@ class VulkanPipelineCache {
   // shader interlock when no Xenos pixel shader provided.
   VkShaderModule depth_only_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule placeholder_pixel_shader_ = VK_NULL_HANDLE;
+  uint64_t shader_probe_pixel_shader_hash_ = 0;
+  VkShaderModule shader_probe_pixel_shader_ = VK_NULL_HANDLE;
   // Depth-only shaders for float24 emulation when no Xenos pixel shader is
   // provided in host render target mode.
   VkShaderModule depth_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;

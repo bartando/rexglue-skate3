@@ -111,8 +111,12 @@ REXCVAR_DEFINE_INT32(vulkan_readback_resolve_max_address, 0, "GPU/Vulkan",
     .range(0, 0x7FFFFFFF)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
-                    "Submit command buffer when PM4 primary buffer ends")
+REXCVAR_DEFINE_INT32(
+    vulkan_primary_buffers_per_submission, 1, "GPU/Vulkan",
+    "Maximum completed PM4 primary buffers to batch into one Vulkan "
+    "submission. Pending work is always submitted before the GPU worker "
+    "waits for more input.")
+    .range(1, 16)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(vulkan_gpu_timestamp_trace_frames, 0, "GPU/Vulkan",
@@ -4058,7 +4062,26 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
 }
 
 void VulkanCommandProcessor::OnPrimaryBufferEnd() {
-  if (REXCVAR_GET(vulkan_submit_on_primary_buffer_end) && submission_open_ &&
+  if (!submission_open_) {
+    return;
+  }
+  if (primary_buffers_in_submission_ != UINT32_MAX) {
+    ++primary_buffers_in_submission_;
+  }
+  if (primary_buffers_in_submission_ >=
+          uint32_t(REXCVAR_GET(
+              vulkan_primary_buffers_per_submission)) &&
+      CanEndSubmissionImmediately()) {
+    EndSubmission(false);
+  }
+}
+
+void VulkanCommandProcessor::PrepareForWait() {
+  CommandProcessor::PrepareForWait();
+  // A count-only batching policy can deadlock when the guest stops producing
+  // PM4 before reaching the configured threshold. Idle is therefore a hard
+  // progress boundary for every non-empty batch.
+  if (submission_open_ && primary_buffers_in_submission_ != 0 &&
       CanEndSubmissionImmediately()) {
     EndSubmission(false);
   }
@@ -4067,6 +4090,111 @@ void VulkanCommandProcessor::OnPrimaryBufferEnd() {
 Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                            const uint32_t* host_address, uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+}
+
+static NativeRhiBorrowedRenderScopeDesc GetNativeGuestBorrowedRenderScope(
+    const ui::vulkan::VulkanDevice* vulkan_device,
+    VulkanRenderTargetCache* render_target_cache,
+    VulkanRenderTargetCache::RenderPassKey render_pass_key) {
+  NativeRhiBorrowedRenderScopeDesc scope;
+  scope.dynamic_rendering =
+      REXCVAR_GET(vulkan_dynamic_rendering) &&
+      vulkan_device->properties().dynamicRendering;
+  scope.render_pass = scope.dynamic_rendering
+                          ? VK_NULL_HANDLE
+                          : render_target_cache->last_update_render_pass();
+  const xenos::ColorRenderTargetFormat color_formats[] = {
+      render_pass_key.color_0_view_format,
+      render_pass_key.color_1_view_format,
+      render_pass_key.color_2_view_format,
+      render_pass_key.color_3_view_format,
+  };
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (render_pass_key.depth_and_color_used & (1u << (1 + i))) {
+      scope.color_attachment_formats[i] =
+          render_target_cache->GetColorVulkanFormat(color_formats[i]);
+      // Dynamic rendering needs the highest location plus one, retaining
+      // VK_FORMAT_UNDEFINED holes in the MRT signature.
+      scope.color_attachment_count = i + 1;
+    }
+  }
+  if (render_pass_key.depth_and_color_used & 1u) {
+    const VkFormat depth_format =
+        render_target_cache->GetDepthVulkanFormat(render_pass_key.depth_format);
+    scope.depth_attachment_format = depth_format;
+    scope.stencil_attachment_format = depth_format;
+  }
+  const bool has_attachments = render_pass_key.depth_and_color_used != 0;
+  if (!has_attachments) {
+    scope.sample_count = VK_SAMPLE_COUNT_1_BIT;
+  } else if (render_pass_key.msaa_samples == xenos::MsaaSamples::k2X &&
+             !render_target_cache->IsMsaa2xSupported(true)) {
+    scope.sample_count = VK_SAMPLE_COUNT_4_BIT;
+    scope.sample_mask = 0b1001;
+  } else {
+    scope.sample_count = VkSampleCountFlagBits(
+        uint32_t(1) << uint32_t(render_pass_key.msaa_samples));
+  }
+  return scope;
+}
+
+static void PopulateNativeGuestBorrowedAttachmentContract(
+    NativeGuestDrawContext& context,
+    const NativeRhiBorrowedRenderScopeDesc& scope) {
+  context.color_attachment_count =
+      std::min(scope.color_attachment_count,
+               NativeGuestDrawContext::kMaxColorAttachments);
+  for (uint32_t i = 0; i < NativeGuestDrawContext::kMaxColorAttachments;
+       ++i) {
+    context.color_attachment_formats[i] =
+        i < context.color_attachment_count
+            ? NativeRhiFormatFromVkFormat(scope.color_attachment_formats[i])
+            : nrhi::Format::kUnknown;
+  }
+  context.depth_attachment_format =
+      NativeRhiFormatFromVkFormat(scope.depth_attachment_format);
+  context.stencil_attachment_format =
+      NativeRhiFormatFromVkFormat(scope.stencil_attachment_format);
+  context.sample_count = uint32_t(scope.sample_count);
+  context.sample_mask = scope.sample_mask;
+  context.borrowed_attachment_contract_valid = true;
+}
+
+static void PopulateNativeGuestDrawStateContract(
+    NativeGuestDrawContext& context, const RegisterFile& regs,
+    reg::RB_DEPTHCONTROL normalized_depth_control,
+    uint32_t normalized_color_mask,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result) {
+  context.normalized_depth_control = normalized_depth_control.value;
+  context.normalized_color_mask = normalized_color_mask;
+  context.color_control = regs.Get<reg::RB_COLORCONTROL>().value;
+  context.blend_control_0 =
+      regs[reg::RB_BLENDCONTROL::rt_register_indices[0]];
+  context.rasterizer_mode_control =
+      regs.Get<reg::PA_SU_SC_MODE_CNTL>().value;
+  context.primitive_restart_index =
+      regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
+  context.primitive_restart_enabled =
+      primitive_processing_result.host_primitive_reset_enabled;
+  context.rasterizer_mode_control_valid = true;
+  context.draw_state_contract_valid = true;
+}
+
+static void PopulateNativeGuestVertexFetchIdentity(
+    NativeGuestDrawContext& context, const RegisterFile& regs) {
+  const auto capture = [&](uint32_t slot) {
+    NativeGuestDrawContext::VertexFetchIdentity identity;
+    const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(slot);
+    identity.physical_address = fetch.address << 2;
+    identity.byte_count = fetch.size << 2;
+    identity.endian = uint32_t(fetch.endian);
+    identity.valid =
+        fetch.type == xenos::FetchConstantType::kVertex &&
+        identity.physical_address != 0 && identity.byte_count != 0;
+    return identity;
+  };
+  context.primary_vertex_fetch = capture(95);
+  context.palette_vertex_fetch = capture(92);
 }
 
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
@@ -4250,6 +4378,45 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
   bool draw_samplers_reused = false;
+  const uint32_t normalized_color_mask =
+      pixel_shader
+          ? draw_util::GetNormalizedColorMask(
+                regs, pixel_shader->writes_color_targets())
+          : 0;
+  if (REXCVAR_GET(vulkan_skip_inert_no_pixel_draws) &&
+      pixel_shader == nullptr && normalized_color_mask == 0 &&
+      !normalized_depth_control.z_enable &&
+      !normalized_depth_control.stencil_enable &&
+      !active_occlusion_query_.valid) {
+    if (debug_log_frame) {
+      ++debug_frame_no_effect_draws_;
+    }
+    return true;
+  }
+
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  bool shader_32bit_index_dma = false;
+  bool native_fast_match_attempted = false;
+  bool native_fast_match_consumed = false;
+  bool native_draw_eligibility_observed = false;
+  draw_util::ViewportInfo viewport_info;
+  auto update_draw_dynamic_state = [&]() {
+    const bool host_render_targets_used =
+        render_target_cache_->GetPath() ==
+        RenderTargetCache::Path::kHostRenderTargets;
+    draw_util::GetHostViewportInfo(
+        regs, texture_cache_->draw_resolution_scale_x(),
+        texture_cache_->draw_resolution_scale_y(), false,
+        device_properties.maxViewportDimensions[0],
+        device_properties.maxViewportDimensions[1], true,
+        normalized_depth_control,
+        host_render_targets_used &&
+            render_target_cache_->depth_float24_convert_in_pixel_shader(),
+        host_render_targets_used,
+        pixel_shader && pixel_shader->writes_depth(), viewport_info);
+    UpdateDynamicState(viewport_info, primitive_polygonal,
+                       normalized_depth_control);
+  };
 
   // Native guest-output renderer active: the emulated frame is never shown,
   // so skip the draw entirely (pipeline setup, texture cache, render target
@@ -4330,8 +4497,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // Tessellation and rectangle expansion variants for rasterization are
     // produced by the primitive processor and are handled by the Vulkan
     // pipeline cache.
-    rex::perf::ScopedCounterTimer translate_stage_timer(
-        rex::perf::CounterId::kDrawStageTranslateUs);
     Shader::HostVertexShaderType host_vertex_shader_type =
         primitive_processing_result.host_vertex_shader_type;
     if (host_vertex_shader_type != Shader::HostVertexShaderType::kVertex &&
@@ -4343,7 +4508,219 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return false;
     }
 
+    shader_32bit_index_dma =
+        !device_properties.fullDrawIndexUint32 &&
+        primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+        vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32 &&
+        primitive_processing_result.host_vertex_shader_type ==
+            Shader::HostVertexShaderType::kVertex;
+
+    // Probe selective native replacement before shader translation, sampler
+    // acquisition, guest texture loading, guest pipeline lookup and binding
+    // preparation. Primitive processing stays before the probe because its
+    // exact host count / indexed decision is part of the replacement identity
+    // and it consumes guest draw state that must advance even when replaced.
+    //
+    // The render-pass key is deliberately unavailable in this cheap probe.
+    // Matchers that require it reject this call and still receive the normal
+    // late exact-key attempt. A successful early matcher consumes its token,
+    // so it is never called again for this guest draw.
+    const bool native_replacement_indexed =
+        primitive_processing_result.index_buffer_type !=
+            PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+        !shader_32bit_index_dma;
+    // A selective draw replacer may be the first NRHI consumer in the title.
+    // Waiting for a native output/post-process callback to create the device
+    // makes the first candidate ineligible and creates a chicken-and-egg
+    // dependency for draw-only replacements.
+    if (native_rhi_device_ == nullptr && HasNativeGuestDrawReplacer()) {
+      native_rhi_device_ = CreateNativeRhiDevice(this);
+      REXGPU_INFO(
+          "Vulkan Native RHI initialized for selective draw replacement");
+    }
+    if (!native_draw_eligibility_observed &&
+        HasNativeGuestDrawEligibilityObserver()) {
+      native_draw_eligibility_observed = true;
+      const bool draw_replacer_available = HasNativeGuestDrawReplacer();
+      const bool host_render_targets =
+          render_target_cache_->GetPath() ==
+          RenderTargetCache::Path::kHostRenderTargets;
+      NativeGuestDrawEligibilityContext eligibility_context;
+      eligibility_context.backend = NativeGuestOutputBackend::kVulkan;
+      eligibility_context.backend_frame_sequence = frame_current_;
+      eligibility_context.vertex_shader_hash =
+          vertex_shader->ucode_data_hash();
+      eligibility_context.pixel_shader_hash =
+          pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0;
+      eligibility_context.primitive_type = uint32_t(prim_type);
+      eligibility_context.guest_vertex_or_index_count =
+          primitive_processing_result.guest_draw_vertex_count;
+      eligibility_context.vertex_or_index_count =
+          primitive_processing_result.host_draw_vertex_count;
+      eligibility_context.guest_index_base =
+          primitive_processing_result.guest_index_base;
+      eligibility_context.processed_index_buffer_type =
+          static_cast<uint32_t>(
+              primitive_processing_result.index_buffer_type);
+      eligibility_context.processed_index_buffer_present =
+          primitive_processing_result.index_buffer_type !=
+          PrimitiveProcessor::ProcessedIndexBufferType::kNone;
+      eligibility_context.shader_32bit_index_dma =
+          shader_32bit_index_dma;
+      eligibility_context.memexport_writes_possible =
+          memexport_writes_possible;
+      eligibility_context.native_rhi_device_available =
+          native_rhi_device_ != nullptr;
+      eligibility_context.draw_replacer_available =
+          draw_replacer_available;
+      eligibility_context.host_render_targets = host_render_targets;
+      eligibility_context.eligible =
+          native_replacement_indexed && !memexport_writes_possible &&
+          native_rhi_device_ != nullptr && draw_replacer_available &&
+          host_render_targets;
+      ObserveNativeGuestDrawEligibility(eligibility_context);
+    }
+    if (!native_fast_match_attempted && native_replacement_indexed &&
+        !memexport_writes_possible && native_rhi_device_ != nullptr &&
+        HasNativeGuestDrawReplacer() &&
+        render_target_cache_->GetPath() ==
+            RenderTargetCache::Path::kHostRenderTargets) {
+      native_fast_match_attempted = true;
+      NativeGuestDrawContext native_draw_context;
+      native_draw_context.backend = NativeGuestOutputBackend::kVulkan;
+      native_draw_context.backend_frame_sequence = frame_current_;
+      native_draw_context.vertex_shader_hash =
+          vertex_shader->ucode_data_hash();
+      native_draw_context.pixel_shader_hash =
+          pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0;
+      native_draw_context.primitive_type = uint32_t(prim_type);
+      native_draw_context.guest_vertex_or_index_count =
+          primitive_processing_result.guest_draw_vertex_count;
+      native_draw_context.vertex_or_index_count =
+          primitive_processing_result.host_draw_vertex_count;
+      native_draw_context.guest_index_base =
+          primitive_processing_result.guest_index_base;
+      native_draw_context.guest_index_base_valid =
+          primitive_processing_result.index_buffer_type !=
+              PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+          primitive_processing_result.index_buffer_type !=
+              PrimitiveProcessor::ProcessedIndexBufferType::
+                  kHostBuiltinForAuto;
+      native_draw_context.surface_pitch =
+          regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+      native_draw_context.indexed = true;
+      PopulateNativeGuestDrawStateContract(
+          native_draw_context, regs, normalized_depth_control,
+          normalized_color_mask, primitive_processing_result);
+      PopulateNativeGuestVertexFetchIdentity(native_draw_context, regs);
+
+      if (MatchesNativeGuestDraw(native_draw_context)) {
+        native_fast_match_consumed = true;
+
+        // A matched draw pays only the state needed by the borrowed native
+        // draw: update the guest attachments, update tracked viewport/scissor,
+        // submit attachment barriers and enter the exact guest render scope.
+        {
+          rex::perf::ScopedCounterTimer stage_timer(
+              rex::perf::CounterId::kDrawStageRenderTargetUs);
+          if (!render_target_cache_->Update(
+                  is_rasterization_done, normalized_depth_control,
+                  normalized_color_mask, *vertex_shader)) {
+            return draw_fail("native_fast_render_target_update");
+          }
+        }
+        {
+          rex::perf::ScopedCounterTimer stage_timer(
+              rex::perf::CounterId::kDrawStageFixedFunctionUs);
+          update_draw_dynamic_state();
+        }
+        {
+          rex::perf::ScopedCounterTimer stage_timer(
+              rex::perf::CounterId::kDrawStageBarriersUs);
+          SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+              render_target_cache_->last_update_render_pass(),
+              render_target_cache_->last_update_framebuffer());
+        }
+
+        const VulkanRenderTargetCache::RenderPassKey render_pass_key =
+            render_target_cache_->last_update_render_pass_key();
+        native_draw_context.render_pass_key = render_pass_key.key;
+        native_draw_context.render_pass_key_valid = true;
+        const NativeRhiBorrowedRenderScopeDesc scope =
+            GetNativeGuestBorrowedRenderScope(
+                GetVulkanDevice(), render_target_cache_.get(),
+                render_pass_key);
+        PopulateNativeGuestBorrowedAttachmentContract(native_draw_context,
+                                                      scope);
+        nrhi::Cmd* const borrowed_cmd =
+            NativeRhiBeginBorrowedRenderScope(native_rhi_device_, scope);
+        bool native_draw_replaced = false;
+        uint32_t native_gpu_timestamp_start = UINT32_MAX;
+        if (borrowed_cmd != nullptr) {
+          const rex::perf::DrawBucket native_draw_bucket =
+              edram_mode == xenos::EdramMode::kDepthOnly
+                  ? rex::perf::DrawBucket::kDepthOnly
+                  : (pixel_shader == nullptr
+                         ? rex::perf::DrawBucket::kNoPixelShader
+                         : rex::perf::DrawBucket::kMainColorDepth);
+          native_gpu_timestamp_start =
+              BeginGpuTimestampedDraw(native_draw_bucket);
+          native_draw_context.device = native_rhi_device_;
+          native_draw_context.cmd = borrowed_cmd;
+          native_draw_replaced =
+              TryReplaceNativeGuestDraw(native_draw_context);
+          NativeRhiEndBorrowedRenderScope(native_rhi_device_);
+          EndGpuTimestampedDraw(native_gpu_timestamp_start);
+        }
+        if (native_draw_replaced) {
+          static bool logged_native_fast_replacement = false;
+          if (!logged_native_fast_replacement) {
+            logged_native_fast_replacement = true;
+            REXLOG_INFO(
+                "native guest draw fast path: skipped guest shader "
+                "translation, samplers, textures, pipeline, bindings and "
+                "vertex residency (vs={:016X} ps={:016X} count={} "
+                "guest_index_base={:08X} guest_index_base_valid={} "
+                "render_pass_key={:08X})",
+                native_draw_context.vertex_shader_hash,
+                native_draw_context.pixel_shader_hash,
+                native_draw_context.vertex_or_index_count,
+                native_draw_context.guest_index_base,
+                native_draw_context.guest_index_base_valid,
+                native_draw_context.render_pass_key);
+          }
+          const uint32_t host_draw_vertex_count =
+              primitive_processing_result.host_draw_vertex_count;
+          const uint32_t host_draw_primitive_count =
+              draw_util::EstimatePrimitiveCount(
+                  primitive_processing_result.host_primitive_type,
+                  host_draw_vertex_count);
+          const rex::perf::DrawBucket native_draw_bucket =
+              edram_mode == xenos::EdramMode::kDepthOnly
+                  ? rex::perf::DrawBucket::kDepthOnly
+                  : (pixel_shader == nullptr
+                         ? rex::perf::DrawBucket::kNoPixelShader
+                         : rex::perf::DrawBucket::kMainColorDepth);
+          PROFILE_DRAW_CALL();
+          PROFILE_VERTICES(host_draw_vertex_count);
+          PROFILE_PRIMITIVES(host_draw_primitive_count);
+          PROFILE_DRAW_BUCKET(native_draw_bucket, host_draw_vertex_count,
+                              host_draw_primitive_count);
+          return true;
+        }
+
+        // The callback contract requires false to mean no draw was issued.
+        // End the guest scope before falling through because the unchanged
+        // guest texture path may dispatch or copy before it re-enters the
+        // render pass. The normal path below revalidates every guest object.
+        SubmitBarriers(true);
+      }
+    }
+
     // Shader modifications.
+    rex::perf::ScopedCounterTimer translate_stage_timer(
+        rex::perf::CounterId::kDrawStageTranslateUs);
     vertex_shader_modification = pipeline_cache_->GetCurrentVertexShaderModification(
         *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask,
         ps_param_gen_pos != UINT32_MAX);
@@ -4474,18 +4851,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   draw_binding_submission_ = GetCurrentSubmission();
   draw_binding_vertex_shader_ = vertex_shader;
   draw_binding_pixel_shader_ = pixel_shader;
-
-  uint32_t normalized_color_mask =
-      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
-                   : 0;
-  if (REXCVAR_GET(vulkan_skip_inert_no_pixel_draws) && pixel_shader == nullptr &&
-      normalized_color_mask == 0 && !normalized_depth_control.z_enable &&
-      !normalized_depth_control.stencil_enable && !active_occlusion_query_.valid) {
-    if (debug_log_frame) {
-      ++debug_frame_no_effect_draws_;
-    }
-    return true;
-  }
 
   // Update the textures before most other work in the submission because
   // samplers depend on this (and in case of sampler overflow in a submission,
@@ -4625,13 +4990,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     current_guest_graphics_pipeline_layout_ = pipeline_layout;
   }
 
-  bool host_render_targets_used =
-      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
-
   // Get dynamic rasterizer state.
-  draw_util::ViewportInfo viewport_info;
   {
     rex::perf::ScopedCounterTimer stage_timer(rex::perf::CounterId::kDrawStageFixedFunctionUs);
     // Just handling maxViewportDimensions is enough - viewportBoundsRange[1] must
@@ -4650,15 +5009,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     // life. Or even disregard the viewport bounds range in the fragment shader
     // interlocks case completely - apply the viewport and the scissor offset
     // directly to pixel address and to things like ps_param_gen.
-    draw_util::GetHostViewportInfo(
-        regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
-        device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1],
-        true, normalized_depth_control,
-        host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
-        host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
-
-    // Update dynamic graphics pipeline state.
-    UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control);
+    update_draw_dynamic_state();
   }
 
   if (debug_team_profile_bg_draw) {
@@ -4690,17 +5041,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     }
   }
 
-  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
-
   // Whether to load the guest 32-bit (usually big-endian) vertex index
   // indirectly in the vertex shader if full 32-bit indices are not supported by
   // the host.
-  bool shader_32bit_index_dma =
-      !device_properties.fullDrawIndexUint32 &&
-      primitive_processing_result.index_buffer_type ==
-          PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
-      vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32 &&
-      primitive_processing_result.host_vertex_shader_type == Shader::HostVertexShaderType::kVertex;
   if (!device_properties.fullDrawIndexUint32 &&
       primitive_processing_result.index_buffer_type ==
           PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
@@ -4934,6 +5277,88 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   pre_draw_stage_timer.Stop();
 
+  const bool native_replacement_indexed =
+      primitive_processing_result.index_buffer_type !=
+          PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+      !shader_32bit_index_dma;
+  bool native_draw_replaced = false;
+  if (!native_fast_match_consumed && native_replacement_indexed &&
+      !memexport_writes_possible &&
+      native_rhi_device_ != nullptr && HasNativeGuestDrawReplacer() &&
+      render_target_cache_->GetPath() ==
+          RenderTargetCache::Path::kHostRenderTargets) {
+    NativeGuestDrawContext native_draw_context;
+    native_draw_context.backend = NativeGuestOutputBackend::kVulkan;
+    native_draw_context.backend_frame_sequence = frame_current_;
+    native_draw_context.vertex_shader_hash =
+        vertex_shader->ucode_data_hash();
+    native_draw_context.pixel_shader_hash =
+        pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0;
+    native_draw_context.primitive_type = uint32_t(prim_type);
+    native_draw_context.guest_vertex_or_index_count =
+        primitive_processing_result.guest_draw_vertex_count;
+    native_draw_context.vertex_or_index_count = host_draw_vertex_count;
+    native_draw_context.guest_index_base =
+        primitive_processing_result.guest_index_base;
+    native_draw_context.guest_index_base_valid =
+        primitive_processing_result.index_buffer_type !=
+            PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+        primitive_processing_result.index_buffer_type !=
+            PrimitiveProcessor::ProcessedIndexBufferType::
+                kHostBuiltinForAuto;
+    native_draw_context.surface_pitch =
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    const VulkanRenderTargetCache::RenderPassKey render_pass_key =
+        render_target_cache_->last_update_render_pass_key();
+    native_draw_context.render_pass_key = render_pass_key.key;
+    native_draw_context.render_pass_key_valid = true;
+    native_draw_context.indexed = true;
+    PopulateNativeGuestDrawStateContract(
+        native_draw_context, regs, normalized_depth_control,
+        normalized_color_mask, primitive_processing_result);
+    PopulateNativeGuestVertexFetchIdentity(native_draw_context, regs);
+    const NativeRhiBorrowedRenderScopeDesc scope =
+        GetNativeGuestBorrowedRenderScope(
+            GetVulkanDevice(), render_target_cache_.get(),
+            render_pass_key);
+    PopulateNativeGuestBorrowedAttachmentContract(native_draw_context, scope);
+
+    if (MatchesNativeGuestDraw(native_draw_context)) {
+      static bool logged_native_replacement_state = false;
+      if (!logged_native_replacement_state) {
+        logged_native_replacement_state = true;
+        REXLOG_INFO(
+            "native guest draw replacement candidate: "
+            "vs={:016X} ps={:016X} count={} primitive={} pitch={} "
+            "guest_index_base={:08X} guest_index_base_valid={} "
+            "render_pass_key={:08X} colors={} depth={} samples={} "
+            "depth_control={:08X} color_mask={:08X}",
+            native_draw_context.vertex_shader_hash,
+            native_draw_context.pixel_shader_hash,
+            native_draw_context.vertex_or_index_count,
+            native_draw_context.primitive_type,
+            native_draw_context.surface_pitch,
+            native_draw_context.guest_index_base,
+            native_draw_context.guest_index_base_valid,
+            native_draw_context.render_pass_key,
+            scope.color_attachment_count,
+            scope.depth_attachment_format != VK_FORMAT_UNDEFINED,
+            uint32_t(scope.sample_count), normalized_depth_control.value,
+            normalized_color_mask);
+      }
+
+      nrhi::Cmd* const borrowed_cmd =
+          NativeRhiBeginBorrowedRenderScope(native_rhi_device_, scope);
+      if (borrowed_cmd != nullptr) {
+        native_draw_context.device = native_rhi_device_;
+        native_draw_context.cmd = borrowed_cmd;
+        native_draw_replaced =
+            TryReplaceNativeGuestDraw(native_draw_context);
+        NativeRhiEndBorrowedRenderScope(native_rhi_device_);
+      }
+    }
+  }
+
   // Draw.
   uint32_t gpu_timestamp_start = BeginGpuTimestampedDraw(draw_bucket);
   if (primitive_processing_result.index_buffer_type ==
@@ -4974,11 +5399,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
         return draw_fail("unexpected_index_buffer_type");
     }
-    deferred_command_buffer_.CmdVkBindIndexBuffer(
-        index_buffer.first, index_buffer.second,
-        primitive_processing_result.host_index_format == xenos::IndexFormat::kInt16
-            ? VK_INDEX_TYPE_UINT16
-            : VK_INDEX_TYPE_UINT32);
+    if (!native_draw_replaced) {
+      deferred_command_buffer_.CmdVkBindIndexBuffer(
+          index_buffer.first, index_buffer.second,
+          primitive_processing_result.host_index_format ==
+                  xenos::IndexFormat::kInt16
+              ? VK_INDEX_TYPE_UINT16
+              : VK_INDEX_TYPE_UINT32);
+    }
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(host_draw_vertex_count);
     PROFILE_PRIMITIVES(host_draw_primitive_count);
@@ -4986,7 +5414,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     if (collect_draw_fingerprints) {
       PROFILE_DRAW_FINGERPRINT(draw_fingerprint);
     }
-    deferred_command_buffer_.CmdVkDrawIndexed(host_draw_vertex_count, 1, 0, 0, 0);
+    if (!native_draw_replaced) {
+      deferred_command_buffer_.CmdVkDrawIndexed(
+          host_draw_vertex_count, 1, 0, 0, 0);
+    }
   }
   EndGpuTimestampedDraw(gpu_timestamp_start);
 
@@ -6456,7 +6887,11 @@ uint32_t VulkanCommandProcessor::BeginGpuTimestampedDraw(rex::perf::DrawBucket b
   if (frame.active_bucket_valid && frame.active_bucket == bucket) {
     return UINT32_MAX;
   }
-  if (frame.query_count + (frame.active_bucket_valid ? 2 : 1) >
+  // Every started bucket must leave room for its end timestamp and the
+  // frame-end timestamp. Without this reservation, draw-heavy frames could
+  // exhaust the pool and permanently lose the only measurement that reports
+  // their total GPU span.
+  if (frame.query_count + (frame.active_bucket_valid ? 4 : 3) >
       kMaxGpuTimestampQueriesPerFrame) {
     return UINT32_MAX;
   }
@@ -7334,6 +7769,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     fences_free_.pop_back();
 
     submission_open_ = false;
+    primary_buffers_in_submission_ = 0;
   }
 
   if (is_closing_frame) {

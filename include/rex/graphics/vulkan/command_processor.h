@@ -268,6 +268,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
   void OnPrimaryBufferEnd() override;
+  void PrepareForWait() override;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -550,6 +551,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<VkSemaphore> semaphores_free_;
 
   bool submission_open_ = false;
+  uint32_t primary_buffers_in_submission_ = 0;
   uint64_t submission_completed_ = 0;
   // In case vkQueueSubmit fails after something like a successful
   // vkQueueBindSparse, to wait correctly on the next attempt.

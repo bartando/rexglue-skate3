@@ -44,7 +44,7 @@ enum class Backend : uint32_t {
 enum class Format : uint32_t {
   kUnknown = 0,
   kR8G8B8A8_UNORM,
-  kR8G8B8A8_UINT,   // vertex blend indices
+  kR8G8B8A8_UINT,  // vertex blend indices
   kR8_UNORM,
   kR8G8_UNORM,
   kB5G6R5_UNORM,
@@ -66,6 +66,13 @@ enum class Format : uint32_t {
   // kR11G11B10_FLOAT has no alpha channel and stores no sign bits.
   kR16G16B16A16_FLOAT,
   kR11G11B10_FLOAT,
+  // Packed depth/stencil, appended so existing enum values remain stable
+  // across separately-built title modules and the emulator executable.
+  kD24_UNORM_S8_UINT,
+  // Host fallback used when packed D24S8 is unavailable (notably MoltenVK).
+  // Kept distinct because borrowed Vulkan pipelines must reproduce the exact
+  // attachment format, even though both represent the guest's D24S8 target.
+  kD32_FLOAT_S8_UINT,
 };
 
 // Block dimensions/bytes for the copy math (1x1 for uncompressed).
@@ -207,6 +214,7 @@ class Texture {
   virtual uint32_t width() const = 0;
   virtual uint32_t height() const = 0;
   virtual Format format() const = 0;
+  virtual uint32_t sample_count() const = 0;
 
  protected:
   virtual ~Texture() = default;
@@ -256,7 +264,7 @@ struct TextureDesc {
   TextureKind kind = TextureKind::k2D;
   uint32_t width = 1;
   uint32_t height = 1;
-  uint32_t depth = 1;       // k3D only
+  uint32_t depth = 1;  // k3D only
   uint32_t mip_levels = 1;
   uint32_t sample_count = 1;
   Format format = Format::kUnknown;
@@ -269,8 +277,8 @@ struct TextureDesc {
 
 struct TextureViewDesc {
   ViewDimension dimension = ViewDimension::k2D;
-  // kUnknown = the texture's own format (D32_FLOAT textures are viewed as
-  // R32_FLOAT automatically).
+  // kUnknown = the texture's own format (depth/stencil textures expose their
+  // depth component automatically).
   Format format = Format::kUnknown;
   uint32_t base_mip = 0;
   uint32_t mip_levels = ~0u;  // ~0u = all remaining
@@ -294,9 +302,9 @@ inline constexpr uint32_t kMaxTextureTableSize = 8;
 
 struct BindingParamDesc {
   BindingParamKind kind = BindingParamKind::kTextureTable;
-  uint32_t shader_register = 0;   // b/t register of the first entry
-  uint32_t count = 1;             // kConstants: number of 32-bit values;
-                                  // kTextureTable: 1 or 2 textures
+  uint32_t shader_register = 0;  // b/t register of the first entry
+  uint32_t count = 1;            // kConstants: number of 32-bit values;
+                                 // kTextureTable: 1 or 2 textures
   Visibility visibility = Visibility::kAll;
 };
 
@@ -351,6 +359,7 @@ struct InputElementDesc {
 };
 
 struct BlendStateDesc {
+  bool alpha_to_coverage = false;
   bool enable = false;
   BlendFactor src = BlendFactor::kOne;
   BlendFactor dst = BlendFactor::kZero;
@@ -377,6 +386,9 @@ struct GraphicsPipelineDesc {
   BlendStateDesc blend;
   DepthStateDesc depth;
   CullMode cull = CullMode::kNone;
+  // Host screen-space winding. Keeping this explicit is required when
+  // translating guest raster state instead of assuming the backend default.
+  bool front_face_clockwise = true;
   bool depth_clip = true;
   Format rtv_format = Format::kUnknown;  // kUnknown = no color target
   Format dsv_format = Format::kUnknown;  // kUnknown = no depth target
@@ -433,23 +445,18 @@ class Cmd {
 
   // kConstants param. Values persist across pipeline changes within the
   // current layout (D3D12 root-constant semantics).
-  virtual void SetRootConstants(uint32_t param, uint32_t count,
-                                const void* values,
+  virtual void SetRootConstants(uint32_t param, uint32_t count, const void* values,
                                 uint32_t dest_offset_in_values) = 0;
   // offset must be kBufferOffsetAlignment-aligned.
-  virtual void SetConstantBuffer(uint32_t param, Buffer* buffer,
-                                 uint64_t offset) = 0;
-  virtual void SetBufferSrv(uint32_t param, Buffer* buffer,
-                            uint64_t offset) = 0;
+  virtual void SetConstantBuffer(uint32_t param, Buffer* buffer, uint64_t offset) = 0;
+  virtual void SetBufferSrv(uint32_t param, Buffer* buffer, uint64_t offset) = 0;
   virtual void SetTexture(uint32_t param, TextureView* view) = 0;
   // Multi-entry kTextureTable params. Binding fewer views than the table
   // declares leaves the tail entries at a backend fallback (white);
   // shaders only sample declared-but-unbound slots behind flags (the old
   // D3D12 "dangling t5" arrangement, made explicit).
-  virtual void SetTexturePair(uint32_t param, TextureView* first,
-                              TextureView* second) = 0;
-  virtual void SetTextures(uint32_t param, TextureView* const* views,
-                           uint32_t count) = 0;
+  virtual void SetTexturePair(uint32_t param, TextureView* first, TextureView* second) = 0;
+  virtual void SetTextures(uint32_t param, TextureView* const* views, uint32_t count) = 0;
 
   // Mip 0 of each. color/depth may each be nullptr.
   virtual void SetRenderTargets(Texture* color, Texture* depth) = 0;
@@ -459,35 +466,39 @@ class Cmd {
   virtual void SetViewport(const Viewport& viewport) = 0;
   virtual void SetScissor(const Rect& rect) = 0;
 
-  virtual void SetVertexBuffer(Buffer* buffer, uint64_t offset,
-                               uint32_t size_bytes, uint32_t stride) = 0;
+  virtual void SetVertexBuffer(Buffer* buffer, uint64_t offset, uint32_t size_bytes,
+                               uint32_t stride) = 0;
   // 16-bit indices (the only index format the scene uses).
-  virtual void SetIndexBuffer(Buffer* buffer, uint64_t offset,
-                              uint32_t size_bytes) = 0;
+  virtual void SetIndexBuffer(Buffer* buffer, uint64_t offset, uint32_t size_bytes) = 0;
   virtual void SetPrimitiveTopology(PrimitiveTopology topology) = 0;
 
+  // Resolves every fallible graphics object required by the currently
+  // latched layout/pipeline/resource tuple without recording a draw. This is
+  // required by in-order guest replacement: a false result leaves the guest
+  // draw authoritative, while a true result makes the matching checked draw
+  // free of lazy PSO/descriptor allocation.
+  virtual bool PreflightDraw() = 0;
   virtual void Draw(uint32_t vertex_count, uint32_t start_vertex) = 0;
-  virtual void DrawIndexed(uint32_t index_count, uint32_t start_index,
-                           int32_t base_vertex) = 0;
+  virtual void DrawIndexed(uint32_t index_count, uint32_t start_index, int32_t base_vertex) = 0;
+  // Returns true only after the indexed draw command has been recorded.
+  // Callers whose output depends on complete recording must use this instead
+  // of the legacy void method so failed state preparation is observable.
+  virtual bool DrawIndexedChecked(uint32_t index_count, uint32_t start_index,
+                                  int32_t base_vertex) = 0;
 
   // Copies. row_pitch must be kRowPitchAlignment-aligned. width/height are
   // the explicit footprint dims in texels (block-aligned for BC formats,
   // exactly as the D3D12 placed footprints were built); depth is 1 except
   // for k3D uploads. array_slice selects the cube face for kCube textures.
-  virtual void CopyBufferToTexture(Texture* dst, uint32_t mip,
-                                   uint32_t array_slice, Buffer* src,
-                                   uint64_t src_offset, uint32_t row_pitch,
-                                   uint32_t width, uint32_t height,
-                                   uint32_t depth) = 0;
-  virtual void CopyTextureToBuffer(Buffer* dst, uint64_t dst_offset,
-                                   uint32_t row_pitch, Texture* src,
-                                   uint32_t mip, uint32_t width,
-                                   uint32_t height) = 0;
+  virtual void CopyBufferToTexture(Texture* dst, uint32_t mip, uint32_t array_slice, Buffer* src,
+                                   uint64_t src_offset, uint32_t row_pitch, uint32_t width,
+                                   uint32_t height, uint32_t depth) = 0;
+  virtual void CopyTextureToBuffer(Buffer* dst, uint64_t dst_offset, uint32_t row_pitch,
+                                   Texture* src, uint32_t mip, uint32_t width, uint32_t height) = 0;
 
   // Queues a transition barrier; FlushBarriers() submits queued barriers
   // (and, on Vulkan, ends any open render pass).
-  virtual void Barrier(Texture* texture, ResourceState before,
-                       ResourceState after) = 0;
+  virtual void Barrier(Texture* texture, ResourceState before, ResourceState after) = 0;
   virtual void FlushBarriers() = 0;
 
   // Marks the start of a renderer pass for GPU-time attribution (closing the
@@ -517,8 +528,7 @@ class Device {
   virtual void Unmap(Buffer* buffer) = 0;
   // Make GPU writes visible before reading mapped readback memory
   // (no-op on D3D12, cache invalidate on non-coherent Vulkan memory).
-  virtual void InvalidateForRead(Buffer* buffer, uint64_t offset,
-                                 uint64_t size) = 0;
+  virtual void InvalidateForRead(Buffer* buffer, uint64_t offset, uint64_t size) = 0;
 
   // Deferred destruction: the object dies when the current submission
   // completes. Views/bindings referencing a destroyed object are retired by
@@ -530,16 +540,14 @@ class Device {
   virtual void DestroyDeferred(Shader* shader) = 0;
 
   // --- render-thread-only ---
-  virtual TextureView* CreateTextureView(Texture* texture,
-                                         const TextureViewDesc& desc) = 0;
+  virtual TextureView* CreateTextureView(Texture* texture, const TextureViewDesc& desc) = 0;
   virtual BindingLayout* CreateBindingLayout(const BindingLayoutDesc& desc) = 0;
   // Returns nullptr on compile failure (details logged).
   virtual Shader* CreateShader(const ShaderDesc& desc) = 0;
   virtual Pipeline* CreateGraphicsPipeline(const GraphicsPipelineDesc& desc) = 0;
 
   // Largest supported sample count <= desired for a render-target format.
-  virtual uint32_t GetSupportedSampleCount(Format format,
-                                           uint32_t desired) = 0;
+  virtual uint32_t GetSupportedSampleCount(Format format, uint32_t desired) = 0;
 
   // The command processor's monotonic submission counters: the basis of all
   // lifetime/readback gating.
