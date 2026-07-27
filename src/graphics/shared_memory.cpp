@@ -15,10 +15,24 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+REXCVAR_DEFINE_BOOL(
+    shared_memory_gpu_exact_watch_diagnostic, false, "GPU",
+    "Report how many watched ranges intersect explicit GPU writes exactly "
+    "versus only sharing a host page.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(
+    shared_memory_filter_gpu_page_only_watches, false, "GPU",
+    "Do not invalidate a watched range when an explicit GPU write only shares "
+    "a host page with it and does not intersect its exact byte range.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
@@ -239,6 +253,8 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
   range->callback_context = callback_context;
   range->callback_data = callback_data;
   range->callback_argument = callback_argument;
+  range->address_first = start;
+  range->address_last = start + length - 1;
   range->page_first = watch_page_first;
   range->page_last = watch_page_last;
 
@@ -279,11 +295,21 @@ void SharedMemory::UnwatchMemoryRange(WatchHandle handle) {
   UnlinkWatchRange(reinterpret_cast<WatchRange*>(handle));
 }
 
-void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu) {
+void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu,
+                               bool exact_address_range_valid, uint32_t exact_address_first,
+                               uint32_t exact_address_last) {
   uint32_t address_first = page_first << page_size_log2_;
   uint32_t address_last = (page_last << page_size_log2_) + ((1 << page_size_log2_) - 1);
   uint32_t bucket_first = address_first >> kWatchBucketSizeLog2;
   uint32_t bucket_last = address_last >> kWatchBucketSizeLog2;
+  const bool exact_gpu_watch_diagnostic =
+      invalidated_by_gpu && exact_address_range_valid &&
+      REXCVAR_GET(shared_memory_gpu_exact_watch_diagnostic);
+  const bool filter_gpu_page_only_watches =
+      invalidated_by_gpu && exact_address_range_valid &&
+      REXCVAR_GET(shared_memory_filter_gpu_page_only_watches);
+  const bool inspect_exact_gpu_watches =
+      exact_gpu_watch_diagnostic || filter_gpu_page_only_watches;
 
   auto global_lock = global_critical_region_.Acquire();
 
@@ -302,11 +328,48 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
       // will be broken.
       node = node->bucket_node_next;
       if (page_first <= range->page_last && page_last >= range->page_first) {
+        if (inspect_exact_gpu_watches) {
+          // A watched range may have a node in multiple 4 MiB buckets. Process
+          // it only in the first bucket touched by this FireWatches call so a
+          // filtered page-only collision is counted once and left linked.
+          uint32_t range_bucket_first =
+              range->address_first >> kWatchBucketSizeLog2;
+          if (i != std::max(bucket_first, range_bucket_first)) {
+            continue;
+          }
+          const bool exact_intersection =
+              exact_address_first <= range->address_last &&
+              exact_address_last >= range->address_first;
+          if (exact_intersection) {
+            ++gpu_exact_watch_hits_since_report_;
+          } else {
+            ++gpu_page_only_watch_hits_since_report_;
+            if (filter_gpu_page_only_watches) {
+              ++gpu_page_only_watch_filtered_since_report_;
+              continue;
+            }
+          }
+        }
         range->callback(global_lock, range->callback_context, range->callback_data,
                         range->callback_argument, invalidated_by_gpu);
         UnlinkWatchRange(range);
       }
     }
+  }
+
+  if (exact_gpu_watch_diagnostic &&
+      ++gpu_exact_watch_writes_since_report_ >= 256) {
+    REXGPU_INFO(
+        "Shared memory exact GPU watches: writes={} exact={} page_only={} "
+        "filtered={}",
+        gpu_exact_watch_writes_since_report_,
+        gpu_exact_watch_hits_since_report_,
+        gpu_page_only_watch_hits_since_report_,
+        gpu_page_only_watch_filtered_since_report_);
+    gpu_exact_watch_writes_since_report_ = 0;
+    gpu_exact_watch_hits_since_report_ = 0;
+    gpu_page_only_watch_hits_since_report_ = 0;
+    gpu_page_only_watch_filtered_since_report_ = 0;
   }
 }
 
@@ -321,7 +384,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
 
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
-  FireWatches(page_first, page_last, true);
+  FireWatches(page_first, page_last, true, true, start, end);
 
   // Mark the range as valid (so pages are not reuploaded until modified by the
   // CPU) and watch it so the CPU can reuse it and this will be caught.
@@ -712,14 +775,14 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   auto global_lock = global_critical_region_.Acquire();
 
   if (!exact_range) {
-    // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
+    // Check if a somewhat wider range (up to 64 host pages) can be
     // invalidated - if no GPU-written data nearby that was not intended to be
     // invalidated since it's not in sync with CPU memory and can't be
     // reuploaded. It's a lot cheaper to upload some excess data than to catch
     // access violations - with 4 KB callbacks, 58410824 (being a
     // software-rendered game) runs at 4 FPS on Intel Core i7-3770, with 64 KB,
-    // the CPU game code takes 3 ms to run per frame, but with 256 KB, it's
-    // 0.7 ms.
+    // the CPU game code takes 3 ms to run per frame, but with 256 KB, it's 0.7
+    // ms.
     if (page_first & 63) {
       uint64_t gpu_written_start = system_page_flags_valid_and_gpu_written_[block_first];
       gpu_written_start &= (uint64_t(1) << (page_first & 63)) - 1;

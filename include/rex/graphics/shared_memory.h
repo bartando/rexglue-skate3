@@ -223,6 +223,8 @@ class SharedMemory {
         void* callback_data;
         uint64_t callback_argument;
         WatchNode* node_first;
+        uint32_t address_first;
+        uint32_t address_last;
         uint32_t page_first;
         uint32_t page_last;
       };
@@ -259,9 +261,16 @@ class SharedMemory {
   uint32_t watch_node_current_pool_allocated_ = 0;
   WatchRange* watch_range_first_free_ = nullptr;
   WatchNode* watch_node_first_free_ = nullptr;
+  uint32_t gpu_exact_watch_writes_since_report_ = 0;
+  uint64_t gpu_exact_watch_hits_since_report_ = 0;
+  uint64_t gpu_page_only_watch_hits_since_report_ = 0;
+  uint64_t gpu_page_only_watch_filtered_since_report_ = 0;
   // Triggers the watches (global and per-range), removing triggered range
-  // watches.
-  void FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);
+  // watches. Exact byte bounds are optional and currently supplied only for
+  // explicit GPU writes; CPU invalidation stays conservatively page-based.
+  void FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu,
+                   bool exact_address_range_valid = false, uint32_t exact_address_first = 0,
+                   uint32_t exact_address_last = 0);
   // Unlinks and frees the range and its nodes. Call this in the global critical
   // region.
   void UnlinkWatchRange(WatchRange* range);
