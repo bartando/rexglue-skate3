@@ -2240,6 +2240,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         if (HasNativeGuestOutputRenderer()) {
           NativeGuestOutputRenderContext native_context;
           native_context.backend = NativeGuestOutputBackend::kD3D12;
+          native_context.backend_frame_sequence = frame_current_;
           native_context.guest_output_width = guest_output_width;
           native_context.guest_output_height = guest_output_height;
           native_context.display_width = display_width;
@@ -2471,6 +2472,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         if (IsNativeGuestOutputPostProcessRequested() && HasNativeGuestOutputPostProcessor()) {
           NativeGuestOutputRenderContext native_context;
           native_context.backend = NativeGuestOutputBackend::kD3D12;
+          native_context.backend_frame_sequence = frame_current_;
           native_context.guest_output_width = guest_output_width;
           native_context.guest_output_height = guest_output_height;
           native_context.display_width = display_width;

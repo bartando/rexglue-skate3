@@ -495,6 +495,7 @@ class NrCmdVulkan : public nrhi::Cmd {
 
   // --- frame handling (driven by the device) ---
   void ResetFrameState();
+  void InvalidateRecordedGraphicsBindings();
   void EndFrame();
 
   NrDeviceVulkan* device = nullptr;
@@ -1508,6 +1509,131 @@ class NrDeviceVulkan : public nrhi::Device {
     borrowed_render_scope_active_ = false;
   }
 
+  bool CanBeginTranslatedReplayScope(
+      nrhi::Texture* color, nrhi::Texture* depth_stencil,
+      nrhi::Format color_format, nrhi::Format depth_stencil_format,
+      uint32_t width, uint32_t height, uint32_t sample_count,
+      const float clear_color_value[4]) {
+    if (!cp_->submission_open() || translated_replay_scope_active_ ||
+        borrowed_render_scope_active_ || cmd_.render_pass_open_ ||
+        color == nullptr || width == 0 || height == 0 ||
+        clear_color_value == nullptr) {
+      return false;
+    }
+    auto* color_vk = static_cast<NrTextureVulkan*>(color);
+    auto* depth_vk = static_cast<NrTextureVulkan*>(depth_stencil);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!live_textures_.contains(color_vk) ||
+          (depth_vk != nullptr && !live_textures_.contains(depth_vk))) {
+        return false;
+      }
+    }
+    if (color_vk->desc.format != color_format ||
+        color_vk->vk_format != ToVkFormat(color_format) ||
+        color_vk->desc.width != width || color_vk->desc.height != height ||
+        color_vk->desc.sample_count != sample_count ||
+        (depth_vk == nullptr) !=
+            (depth_stencil_format == nrhi::Format::kUnknown)) {
+      return false;
+    }
+    if (depth_vk != nullptr &&
+        (depth_vk->desc.format != depth_stencil_format ||
+         depth_vk->vk_format != ToVkFormat(depth_stencil_format) ||
+         depth_vk->desc.width != width || depth_vk->desc.height != height ||
+         depth_vk->desc.sample_count != sample_count ||
+         !(depth_vk->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))) {
+      return false;
+    }
+    return true;
+  }
+
+  bool BeginTranslatedReplayScope(
+      nrhi::Texture* color, nrhi::Texture* depth_stencil,
+      nrhi::Format color_format, nrhi::Format depth_stencil_format,
+      uint32_t width, uint32_t height, uint32_t sample_count,
+      bool clear_color, const float clear_color_value[4],
+      bool clear_depth_stencil, float clear_depth_value,
+      uint32_t clear_stencil_value) {
+    if (!CanBeginTranslatedReplayScope(
+            color, depth_stencil, color_format, depth_stencil_format,
+            width, height, sample_count, clear_color_value)) {
+      return false;
+    }
+    auto* color_vk = static_cast<NrTextureVulkan*>(color);
+    auto* depth_vk = static_cast<NrTextureVulkan*>(depth_stencil);
+
+    EnsureLayout(color_vk, ToStateInfo(ResourceState::kRenderTarget));
+    if (depth_vk != nullptr) {
+      EnsureLayout(depth_vk, ToStateInfo(ResourceState::kDepthWrite));
+    }
+    cp_->SubmitBarriers(true);
+    VkImageView color_view = GetAttachmentView(color_vk);
+    VkImageView depth_view =
+        depth_vk != nullptr ? GetAttachmentView(depth_vk) : VK_NULL_HANDLE;
+    if (color_view == VK_NULL_HANDLE ||
+        (depth_vk != nullptr && depth_view == VK_NULL_HANDLE)) {
+      return false;
+    }
+
+    VkRenderingAttachmentInfo color_attachment = {};
+    color_attachment.sType =
+        VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color_attachment.imageView = color_view;
+    color_attachment.imageLayout =
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color_attachment.loadOp =
+        clear_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    std::memcpy(color_attachment.clearValue.color.float32, clear_color_value,
+                sizeof(float) * 4);
+
+    VkRenderingAttachmentInfo depth_attachment = {};
+    if (depth_vk != nullptr) {
+      depth_attachment.sType =
+          VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+      depth_attachment.imageView = depth_view;
+      depth_attachment.imageLayout =
+          VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+      depth_attachment.loadOp = clear_depth_stencil
+                                    ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                    : VK_ATTACHMENT_LOAD_OP_LOAD;
+      depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      depth_attachment.clearValue.depthStencil = {
+          clear_depth_value, clear_stencil_value};
+    }
+
+    VkRenderingInfo rendering_info = {};
+    rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering_info.renderArea.extent = {width, height};
+    rendering_info.layerCount = 1;
+    rendering_info.colorAttachmentCount = 1;
+    rendering_info.pColorAttachments = &color_attachment;
+    if (depth_vk != nullptr) {
+      rendering_info.pDepthAttachment = &depth_attachment;
+      if (depth_vk->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+        rendering_info.pStencilAttachment = &depth_attachment;
+      }
+    }
+    cp_->deferred_command_buffer().CmdVkBeginRendering(&rendering_info);
+    translated_replay_scope_active_ = true;
+    return true;
+  }
+
+  void EndTranslatedReplayScope() {
+    if (!translated_replay_scope_active_) {
+      return;
+    }
+    cp_->deferred_command_buffer().CmdVkEndRendering();
+    translated_replay_scope_active_ = false;
+    // Direct translated replay bypasses NRHI's Vulkan binding latches, but it
+    // must not erase the caller's logical command-list state. ResetFrameState
+    // did that, leaving later NRHI draws with null layout/pipeline/resources
+    // even though the caller had not changed them. Preserve the logical state
+    // and force every disturbed physical binding to be recorded again.
+    cmd_.InvalidateRecordedGraphicsBindings();
+  }
+
   void EndFrame() {
     cmd_.EndFrame();
     // Render-thread CPU attribution for slow frames (throttled 8 per 5 s).
@@ -2405,6 +2531,7 @@ class NrDeviceVulkan : public nrhi::Device {
   // may be emitted by NRHI while this is active.
   bool borrowed_render_scope_active_ = false;
   NativeRhiBorrowedRenderScopeDesc borrowed_render_scope_desc_{};
+  bool translated_replay_scope_active_ = false;
 
   // White 1x1 fallback.
   VkImage white_image_ = VK_NULL_HANDLE;
@@ -2474,6 +2601,25 @@ void NrCmdVulkan::ResetFrameState() {
     // drop the flag.
     REXLOG_ERROR("nrhi-vulkan: render pass leaked across frames (state dropped)");
     render_pass_open_ = false;
+  }
+}
+
+void NrCmdVulkan::InvalidateRecordedGraphicsBindings() {
+  // The external scope is balanced before this call, so there is no NRHI pass
+  // open. Keep all logical D3D-style latches (layout, pipeline, constants,
+  // buffers, textures and render targets), but forget what Vulkan has bound.
+  render_pass_open_ = false;
+  bound_pipeline_ = VK_NULL_HANDLE;
+  set0_rebind_needed_ = true;
+  set0_bound_ = VK_NULL_HANDLE;
+  if (layout_ != nullptr) {
+    for (uint32_t i = 0; i < layout_->param_count; ++i) {
+      const NrBindingLayoutVulkan::ParamInfo& parameter =
+          layout_->params[i];
+      if (parameter.kind == nrhi::BindingParamKind::kTextureTable) {
+        table_dirty_[parameter.table_index] = true;
+      }
+    }
   }
 }
 
@@ -3181,6 +3327,34 @@ nrhi::Cmd* NativeRhiBeginBorrowedRenderScope(nrhi::Device* device,
 
 void NativeRhiEndBorrowedRenderScope(nrhi::Device* device) {
   static_cast<NrDeviceVulkan*>(device)->EndBorrowedRenderScope();
+}
+
+bool NativeRhiBeginTranslatedReplayScope(
+    nrhi::Device* device, nrhi::Texture* color,
+    nrhi::Texture* depth_stencil, nrhi::Format color_format,
+    nrhi::Format depth_stencil_format, uint32_t width, uint32_t height,
+    uint32_t sample_count, bool clear_color,
+    const float clear_color_value[4], bool clear_depth_stencil,
+    float clear_depth_value, uint32_t clear_stencil_value) {
+  return static_cast<NrDeviceVulkan*>(device)->BeginTranslatedReplayScope(
+      color, depth_stencil, color_format, depth_stencil_format, width, height,
+      sample_count, clear_color, clear_color_value, clear_depth_stencil,
+      clear_depth_value, clear_stencil_value);
+}
+
+bool NativeRhiCanBeginTranslatedReplayScope(
+    nrhi::Device* device, nrhi::Texture* color,
+    nrhi::Texture* depth_stencil, nrhi::Format color_format,
+    nrhi::Format depth_stencil_format, uint32_t width, uint32_t height,
+    uint32_t sample_count, const float clear_color_value[4]) {
+  return static_cast<NrDeviceVulkan*>(device)
+      ->CanBeginTranslatedReplayScope(
+          color, depth_stencil, color_format, depth_stencil_format, width,
+          height, sample_count, clear_color_value);
+}
+
+void NativeRhiEndTranslatedReplayScope(nrhi::Device* device) {
+  static_cast<NrDeviceVulkan*>(device)->EndTranslatedReplayScope();
 }
 
 }  // namespace rex::graphics::vulkan

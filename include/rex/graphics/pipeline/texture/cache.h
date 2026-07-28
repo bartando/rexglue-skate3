@@ -144,9 +144,12 @@ class TextureCache {
     uint32_t depth_or_array_size = 0;
     uint32_t format = 0;
     bool scaled_resolve = false;
+    uint64_t content_generation = 0;
+    uint32_t outdated_mask = 0;
   };
   bool DebugGetActiveTextureBinding(uint32_t fetch_constant_index,
-                                    DebugActiveTextureBinding& binding_out) const;
+                                    DebugActiveTextureBinding& binding_out,
+                                    bool signed_view = false) const;
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -256,6 +259,9 @@ class TextureCache {
     static constexpr uint32_t kOutdatedBitBase = UINT32_C(1) << 0;
     static constexpr uint32_t kOutdatedBitMips = UINT32_C(1) << 1;
     uint32_t outdated_mask() const { return outdated_mask_.load(std::memory_order_acquire); }
+    uint64_t content_generation() const {
+      return content_generation_.load(std::memory_order_acquire);
+    }
 
     bool base_outdated(const std::unique_lock<std::recursive_mutex>& global_lock) const {
       return base_outdated_;
@@ -308,6 +314,10 @@ class TextureCache {
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
     std::atomic<uint32_t> outdated_mask_{0};
+    // Incremented whenever guest memory invalidates this host texture. Equal
+    // object identity + generation + resident state proves the cached content
+    // did not change between two observed bindings.
+    std::atomic<uint64_t> content_generation_{1};
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;

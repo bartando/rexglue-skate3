@@ -90,6 +90,7 @@ REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
 REXCVAR_DECLARE(int32_t, vulkan_primary_buffers_per_submission);
 REXCVAR_DECLARE(bool, vulkan_dynamic_rendering);
 REXCVAR_DECLARE(bool, vulkan_async_skip_incomplete_frames);
+REXCVAR_DECLARE(bool, vulkan_generic_main_guarded_replay);
 REXCVAR_DECLARE(int32_t, vulkan_async_placeholder_max_consecutive_skips);
 REXCVAR_DECLARE(int32_t, vulkan_debug_log_frame_summaries_remaining);
 REXCVAR_DECLARE(int32_t, vulkan_debug_frame_summary_interval_frames);

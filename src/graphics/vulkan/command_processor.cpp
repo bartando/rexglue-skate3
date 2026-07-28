@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -64,6 +65,14 @@
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Guarded three-tile capture for every MAIN shader pair, not only the four
+// families that were reverse engineered individually. Diagnostic only: it
+// never suppresses, replaces, or presents guest rendering. Costs capture time
+// during the observation window, so it is off unless a title asks for it.
+REXCVAR_DEFINE_BOOL(vulkan_generic_main_guarded_replay, false, "GPU/Vulkan",
+                    "Guard and three-tile-prove every MAIN draw family for "
+                    "native replay, instead of a fixed family whitelist");
 
 REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
@@ -182,6 +191,207 @@ const char* ReadbackResolveModeName(ReadbackResolveMode mode) {
       return "auto";
   }
   return "unknown";
+}
+
+constexpr uint64_t kGuardedPs328VertexShader =
+    UINT64_C(0x0E9982BE6B1E99A1);
+constexpr uint64_t kGuardedPs328PixelShader =
+    UINT64_C(0x328FA02B07C392DC);
+constexpr uint64_t kGuarded9EVertexShader =
+    UINT64_C(0x37F2AEC8A23E44E0);
+constexpr uint64_t kGuarded9EPixelShader =
+    UINT64_C(0x9E1AF02A96682354);
+constexpr uint64_t kGuardedC6VertexShader =
+    UINT64_C(0xBD4B1DF972B828B7);
+constexpr uint64_t kGuardedC6PixelShader =
+    UINT64_C(0xC6CEFDA3753CF2BA);
+constexpr uint64_t kGuarded14DVertexShader40 =
+    UINT64_C(0x4EAEC701E97DCDAD);
+constexpr uint64_t kGuarded14DVertexShader48 =
+    UINT64_C(0x08D6210341AD63F6);
+constexpr uint64_t kGuarded14DPixelShader =
+    UINT64_C(0x14D6B61CBC3D853C);
+
+constexpr std::array<GuardedReplayFamilySpec, 3>
+    kGuardedNonPsFamilySpecs{{
+        {
+            .family = NativeGuestGuardedReplayFamily::kVenue9E,
+            .vertex_shader_hashes = {kGuarded9EVertexShader, 0},
+            .vertex_shader_count = 1,
+            .pixel_shader_hash = kGuarded9EPixelShader,
+            .maximum_first_block_tokens = 64,
+            .maximum_guarded_bytes = 64 * 1024 * 1024,
+            .maximum_ranges_per_token = 64,
+            .maximum_frame_ranges = 1024,
+            .minimum_unique_textures = 1,
+            .maximum_unique_textures = 16,
+        },
+        {
+            .family = NativeGuestGuardedReplayFamily::kCrowdC6,
+            .vertex_shader_hashes = {kGuardedC6VertexShader, 0},
+            .vertex_shader_count = 1,
+            .pixel_shader_hash = kGuardedC6PixelShader,
+            .maximum_first_block_tokens = 156,
+            .maximum_guarded_bytes = 32 * 1024 * 1024,
+            .maximum_ranges_per_token = 16,
+            .maximum_frame_ranges = 1024,
+            .minimum_unique_textures = 1,
+            .maximum_unique_textures = 1,
+        },
+        {
+            .family = NativeGuestGuardedReplayFamily::kVenue14D,
+            .vertex_shader_hashes = {kGuarded14DVertexShader40,
+                                     kGuarded14DVertexShader48},
+            .vertex_shader_count = 2,
+            .pixel_shader_hash = kGuarded14DPixelShader,
+            .maximum_first_block_tokens = 64,
+            .maximum_guarded_bytes = 128 * 1024 * 1024,
+            .maximum_ranges_per_token = 64,
+            .maximum_frame_ranges = 4096,
+            .minimum_unique_textures = 5,
+            .maximum_unique_textures = 5,
+        },
+    }};
+
+bool GuardedFamilySpecMatchesShaders(const GuardedReplayFamilySpec &spec,
+                                     uint64_t vertex_shader_hash,
+                                     uint64_t pixel_shader_hash) {
+  return pixel_shader_hash == spec.pixel_shader_hash &&
+         std::find(spec.vertex_shader_hashes.begin(),
+                   spec.vertex_shader_hashes.begin() +
+                       spec.vertex_shader_count,
+                   vertex_shader_hash) !=
+             spec.vertex_shader_hashes.begin() +
+                 spec.vertex_shader_count;
+}
+
+size_t FindGuardedNonPsFamilyIndexByShaders(uint64_t vertex_shader_hash,
+                                           uint64_t pixel_shader_hash) {
+  const auto found = std::ranges::find_if(
+      kGuardedNonPsFamilySpecs, [&](const GuardedReplayFamilySpec &spec) {
+        return GuardedFamilySpecMatchesShaders(
+            spec, vertex_shader_hash, pixel_shader_hash);
+      });
+  return found == kGuardedNonPsFamilySpecs.end()
+             ? kGuardedNonPsFamilySpecs.size()
+             : size_t(found - kGuardedNonPsFamilySpecs.begin());
+}
+
+// Budgets for a MAIN family discovered at run time. They are deliberately
+// tighter than the hand-tuned seeds: a discovered family has not been proven
+// to need more, and dozens of them may be live at once. A family that needs
+// more than this is exactly the "genuinely weird case" that still deserves a
+// bespoke path.
+constexpr GuardedReplayFamilySpec kGuardedGenericFamilySpec{
+    .family = NativeGuestGuardedReplayFamily::kGenericMain,
+    .vertex_shader_hashes = {0, 0},
+    .vertex_shader_count = 1,
+    .pixel_shader_hash = 0,
+    .maximum_first_block_tokens = 192,
+    // Shared across every discovered family; see shares_generic_byte_budget.
+    .maximum_guarded_bytes = 384 * 1024 * 1024,
+    .maximum_ranges_per_token = 64,
+    .maximum_frame_ranges = 4096,
+    .minimum_unique_textures = 0,
+    .maximum_unique_textures = 16,
+    .shares_generic_byte_budget = true,
+};
+
+// A discovered family that cannot pass its three-tile proof this many frames
+// running is dropped from generic capture. Without this, every non-MAIN draw
+// in the title would pay full guarded-capture cost forever, which is the same
+// mistake that once reduced gameplay to roughly 2.5 FPS.
+//
+// The window is generous on purpose. Abandonment is one-way, and real MAIN
+// families do go unproven for long stretches before they settle - CrowdC6 has
+// been observed rejected for dozens of consecutive frames and then proving all
+// 156 of its draws. Only frames where the family actually submitted draws
+// count toward this, so it retires idle non-MAIN work without racing a family
+// that is still converging.
+constexpr uint32_t kGuardedGenericFamilyAbandonFrames = 240;
+
+bool IsBuiltInGuardedReplayFamily(uint64_t vertex_shader_hash,
+                                  uint64_t pixel_shader_hash) {
+  return (vertex_shader_hash == kGuardedPs328VertexShader &&
+          pixel_shader_hash == kGuardedPs328PixelShader) ||
+         FindGuardedNonPsFamilyIndexByShaders(
+             vertex_shader_hash, pixel_shader_hash) !=
+             kGuardedNonPsFamilySpecs.size();
+}
+
+void ObserveGuestShaderArtifactIfRequested(
+    const VulkanShader::VulkanTranslation* translation) {
+  if (translation == nullptr || !translation->is_valid() ||
+      !translation->is_translated() ||
+      !HasNativeGuestShaderArtifactObserver()) {
+    return;
+  }
+
+  const VulkanShader& shader =
+      static_cast<const VulkanShader&>(translation->shader());
+  const bool is_vertex_shader = shader.type() == xenos::ShaderType::kVertex;
+  if (!ShouldObserveNativeGuestShaderArtifact(
+          shader.ucode_data_hash(), translation->modification(),
+          is_vertex_shader)) {
+    return;
+  }
+
+  const std::vector<uint8_t>& binary = translation->translated_binary();
+  constexpr uint32_t kSpirvMagic = 0x07230203;
+  if (binary.size() < 5 * sizeof(uint32_t) ||
+      binary.size() % sizeof(uint32_t) != 0) {
+    return;
+  }
+  uint32_t magic = 0;
+  std::memcpy(&magic, binary.data(), sizeof(magic));
+  if (magic != kSpirvMagic) {
+    return;
+  }
+
+  NativeGuestShaderArtifactContext artifact;
+  artifact.backend = NativeGuestOutputBackend::kVulkan;
+  artifact.shader_hash = shader.ucode_data_hash();
+  artifact.modification = translation->modification();
+  artifact.is_vertex_shader = is_vertex_shader;
+  artifact.spirv.resize(binary.size() / sizeof(uint32_t));
+  std::memcpy(artifact.spirv.data(), binary.data(), binary.size());
+  artifact.used_texture_fetch_mask =
+      shader.GetUsedTextureMaskAfterTranslation();
+
+  const std::vector<VulkanShader::TextureBinding>& texture_bindings =
+      shader.GetTextureBindingsAfterTranslation();
+  artifact.texture_bindings.reserve(texture_bindings.size());
+  for (size_t binding_index = 0; binding_index < texture_bindings.size();
+       ++binding_index) {
+    const VulkanShader::TextureBinding& binding =
+        texture_bindings[binding_index];
+    NativeGuestShaderArtifactContext::TextureBinding copied_binding;
+    copied_binding.binding = uint32_t(binding_index);
+    copied_binding.fetch_constant = binding.fetch_constant;
+    copied_binding.dimension = uint32_t(binding.dimension);
+    copied_binding.is_signed = binding.is_signed != 0;
+    artifact.texture_bindings.push_back(copied_binding);
+  }
+
+  const std::vector<VulkanShader::SamplerBinding>& sampler_bindings =
+      shader.GetSamplerBindingsAfterTranslation();
+  artifact.sampler_bindings.reserve(sampler_bindings.size());
+  for (size_t binding_index = 0; binding_index < sampler_bindings.size();
+       ++binding_index) {
+    const VulkanShader::SamplerBinding& binding =
+        sampler_bindings[binding_index];
+    NativeGuestShaderArtifactContext::SamplerBinding copied_binding;
+    copied_binding.binding =
+        uint32_t(texture_bindings.size() + binding_index);
+    copied_binding.fetch_constant = binding.fetch_constant;
+    copied_binding.mag_filter = uint32_t(binding.mag_filter);
+    copied_binding.min_filter = uint32_t(binding.min_filter);
+    copied_binding.mip_filter = uint32_t(binding.mip_filter);
+    copied_binding.aniso_filter = uint32_t(binding.aniso_filter);
+    artifact.sampler_bindings.push_back(copied_binding);
+  }
+  artifact.valid = true;
+  ObserveNativeGuestShaderArtifact(artifact);
 }
 
 // Periodic GPU clock/P-state telemetry. All timestamp buckets inflating
@@ -843,6 +1053,28 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
 }
 
 VulkanCommandProcessor::~VulkanCommandProcessor() = default;
+
+void VulkanCommandProcessor::TranslatedRectangleWatchCallback(
+    const std::unique_lock<std::recursive_mutex>& global_lock,
+    void* context, void* data, uint64_t argument,
+    bool invalidated_by_gpu) {
+  (void)global_lock;
+  (void)data;
+  (void)argument;
+  auto* command_processor =
+      static_cast<VulkanCommandProcessor*>(context);
+  const uint64_t invalidated_generation =
+      command_processor->translated_rectangle_guard_generation_.fetch_add(
+          1, std::memory_order_acq_rel) +
+      1;
+  if (invalidated_by_gpu) {
+    command_processor
+        ->translated_rectangle_last_gpu_invalidation_generation_.store(
+            invalidated_generation, std::memory_order_release);
+  }
+  command_processor->translated_rectangle_guard_active_.store(
+      false, std::memory_order_release);
+}
 
 void VulkanCommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
@@ -2843,6 +3075,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
           NativeGuestOutputRenderContext native_context;
           native_context.backend = NativeGuestOutputBackend::kVulkan;
+          native_context.backend_frame_sequence = frame_current_;
           native_context.guest_output_width = guest_output_width;
           native_context.guest_output_height = guest_output_height;
           native_context.display_width = display_width;
@@ -2858,7 +3091,62 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           // Attribute the native pass's GPU time to its own profile bucket
           // (it otherwise smears into the last emulated draw's bucket).
           BeginGpuTimestampedRegion(rex::perf::DrawBucket::kNativeScene);
+          SetNativeGuestTranslatedReplayBackend(
+              [](const NativeGuestOutputRenderContext& output_context,
+                 const NativeGuestTranslatedReplayTokenContext& token,
+                 const NativeGuestTranslatedReplayTarget& target,
+                 void* user_data) {
+                return static_cast<VulkanCommandProcessor*>(user_data)
+                    ->ReplayNativeGuestTranslatedDraw(output_context, token,
+                                                      target);
+              },
+              this);
+          SetNativeGuestTranslatedReplayBatchBackend(
+              [](const NativeGuestOutputRenderContext& output_context,
+                 const std::vector<
+                     NativeGuestTranslatedReplayTokenContext>& tokens,
+                 const NativeGuestTranslatedReplayTarget& target,
+                 void* user_data) {
+                return static_cast<VulkanCommandProcessor*>(user_data)
+                    ->ReplayNativeGuestTranslatedDrawBatch(
+                        output_context, tokens, target);
+              },
+              this);
+          SetNativeGuestGuardedPs328Tile1TokenQuery(
+              [](uint64_t backend_frame_sequence,
+                 std::vector<NativeGuestTranslatedReplayTokenContext>
+                     &tokens,
+                 void *user_data) {
+                return static_cast<VulkanCommandProcessor *>(user_data)
+                    ->GetCurrentFrameGuardedPs328Tile1ReplayTokens(
+                        backend_frame_sequence, tokens);
+              },
+              this);
+          SetNativeGuestGuardedReplayPacketQuery(
+              [](NativeGuestGuardedReplayFamily family,
+                 uint64_t backend_frame_sequence,
+                 NativeGuestGuardedReplayPacket &packet,
+                 void *user_data) {
+                return static_cast<VulkanCommandProcessor *>(user_data)
+                    ->GetCurrentFrameGuardedReplayPacket(
+                        family, backend_frame_sequence, packet);
+              },
+              this);
+          SetNativeGuestGuardedMainReplayBatchQuery(
+              [](uint64_t backend_frame_sequence,
+                 NativeGuestGuardedMainReplayBatch &batch,
+                 void *user_data) {
+                return static_cast<VulkanCommandProcessor *>(user_data)
+                    ->GetCurrentFrameGuardedMainReplayBatch(
+                        backend_frame_sequence, batch);
+              },
+              this);
           if (TryRenderNativeGuestOutput(native_context)) {
+            SetNativeGuestGuardedMainReplayBatchQuery(nullptr, nullptr);
+            SetNativeGuestGuardedReplayPacketQuery(nullptr, nullptr);
+            SetNativeGuestGuardedPs328Tile1TokenQuery(nullptr, nullptr);
+            SetNativeGuestTranslatedReplayBatchBackend(nullptr, nullptr);
+            SetNativeGuestTranslatedReplayBackend(nullptr, nullptr);
             NativeRhiEndFrame(native_rhi_device_);
             // Need to submit all the commands before giving the image back
             // to the presenter (it submits its own for displaying it), and
@@ -2867,6 +3155,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
             EndSubmission(true);
             return true;
           }
+          SetNativeGuestGuardedMainReplayBatchQuery(nullptr, nullptr);
+          SetNativeGuestGuardedReplayPacketQuery(nullptr, nullptr);
+          SetNativeGuestGuardedPs328Tile1TokenQuery(nullptr, nullptr);
+          SetNativeGuestTranslatedReplayBatchBackend(nullptr, nullptr);
+          SetNativeGuestTranslatedReplayBackend(nullptr, nullptr);
           // The renderer yielded to the emulated path: close anything the
           // callback may have left open (render pass, pending clears) -
           // the gamma pass below records into the same deferred command
@@ -3366,6 +3659,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         if (IsNativeGuestOutputPostProcessRequested() && HasNativeGuestOutputPostProcessor()) {
           NativeGuestOutputRenderContext native_context;
           native_context.backend = NativeGuestOutputBackend::kVulkan;
+          native_context.backend_frame_sequence = frame_current_;
           native_context.guest_output_width = guest_output_width;
           native_context.guest_output_height = guest_output_height;
           native_context.display_width = display_width;
@@ -3752,6 +4046,1551 @@ void VulkanCommandProcessor::EndRenderPass() {
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
   in_render_pass_ = false;
+}
+
+bool VulkanCommandProcessor::
+    GetCurrentFrameGuardedPs328Tile1ReplayTokens(
+        uint64_t backend_frame_sequence,
+        std::vector<NativeGuestTranslatedReplayTokenContext> &tokens) const {
+  tokens.clear();
+  enum class QueryFailure : uint32_t {
+    kRequestedFrameZero = 1,
+    kRequestedFrameNotCurrent,
+    kTokenFrameNotCurrent,
+    kSubmissionClosed,
+    kCandidateFamilyNotProven,
+    kNoGuardedCandidates,
+    kContractCountMismatch,
+    kStateTokenInvalid,
+    kStateTokenNotStable,
+    kStateTokenFrameMismatch,
+    kStateFrameMismatch,
+    kStateOpaqueTokenMismatch,
+    kStateGuestRangesMissing,
+    kStateTexturePayloadCount,
+    kReturnedCountMismatch,
+  };
+  const auto query_failure_name = [](QueryFailure failure) {
+    switch (failure) {
+      case QueryFailure::kRequestedFrameZero:
+        return "requested_frame_zero";
+      case QueryFailure::kRequestedFrameNotCurrent:
+        return "requested_frame_not_current";
+      case QueryFailure::kTokenFrameNotCurrent:
+        return "token_frame_not_current";
+      case QueryFailure::kSubmissionClosed:
+        return "submission_closed";
+      case QueryFailure::kCandidateFamilyNotProven:
+        return "candidate_family_not_proven";
+      case QueryFailure::kNoGuardedCandidates:
+        return "no_guarded_candidates";
+      case QueryFailure::kContractCountMismatch:
+        return "contract_count_mismatch";
+      case QueryFailure::kStateTokenInvalid:
+        return "state_token_invalid";
+      case QueryFailure::kStateTokenNotStable:
+        return "state_token_not_stable";
+      case QueryFailure::kStateTokenFrameMismatch:
+        return "state_token_frame_mismatch";
+      case QueryFailure::kStateFrameMismatch:
+        return "state_frame_mismatch";
+      case QueryFailure::kStateOpaqueTokenMismatch:
+        return "state_opaque_token_mismatch";
+      case QueryFailure::kStateGuestRangesMissing:
+        return "state_guest_ranges_missing";
+      case QueryFailure::kStateTexturePayloadCount:
+        return "state_texture_payload_count";
+      case QueryFailure::kReturnedCountMismatch:
+        return "returned_count_mismatch";
+    }
+    return "unknown";
+  };
+  const auto query_failure =
+      [&](QueryFailure failure, size_t state_offset) {
+        tokens.clear();
+        uint64_t signature = UINT64_C(1469598103934665603);
+        const auto mix = [&](uint64_t value) {
+          signature ^= value;
+          signature *= UINT64_C(1099511628211);
+        };
+        mix(uint32_t(failure));
+        mix(backend_frame_sequence);
+        mix(frame_current_);
+        mix(translated_replay_token_frame_);
+        mix(submission_open_);
+        mix(uint32_t(translated_ps328_candidate_phase_));
+        mix(translated_ps328_guarded_candidate_count_);
+        mix(translated_ps328_first_block_contracts_.size());
+        mix(translated_replay_token_states_.size());
+        mix(state_offset);
+        if (signature !=
+            translated_ps328_query_failure_signature_) {
+          translated_ps328_query_failure_signature_ = signature;
+          REXLOG_INFO(
+              "Translated PS328 tile1 token query rejected: reason={} "
+              "requested_frame={} current_frame={} token_frame={} "
+              "submission_open={} phase={} guarded_count={} "
+              "contract_count={} state_count={} state_offset={}",
+              query_failure_name(failure), backend_frame_sequence,
+              frame_current_, translated_replay_token_frame_,
+              submission_open_,
+              uint32_t(translated_ps328_candidate_phase_),
+              translated_ps328_guarded_candidate_count_,
+              translated_ps328_first_block_contracts_.size(),
+              translated_replay_token_states_.size(), state_offset);
+        }
+        return false;
+      };
+  constexpr size_t kNoStateOffset = std::numeric_limits<size_t>::max();
+  if (backend_frame_sequence == 0) {
+    return query_failure(QueryFailure::kRequestedFrameZero,
+                         kNoStateOffset);
+  }
+  if (backend_frame_sequence != frame_current_) {
+    return query_failure(
+        QueryFailure::kRequestedFrameNotCurrent, kNoStateOffset);
+  }
+  if (translated_replay_token_frame_ != frame_current_) {
+    return query_failure(QueryFailure::kTokenFrameNotCurrent,
+                         kNoStateOffset);
+  }
+  if (!submission_open_) {
+    return query_failure(QueryFailure::kSubmissionClosed,
+                         kNoStateOffset);
+  }
+  if (translated_ps328_candidate_phase_ !=
+      GuardedReplayCandidatePhase::kProven) {
+    return query_failure(
+        QueryFailure::kCandidateFamilyNotProven, kNoStateOffset);
+  }
+  if (translated_ps328_guarded_candidate_count_ == 0) {
+    return query_failure(QueryFailure::kNoGuardedCandidates,
+                         kNoStateOffset);
+  }
+  if (translated_ps328_guarded_candidate_count_ !=
+      translated_ps328_first_block_contracts_.size()) {
+    return query_failure(QueryFailure::kContractCountMismatch,
+                         kNoStateOffset);
+  }
+
+  constexpr uint64_t kPs328VertexShader =
+      UINT64_C(0x0E9982BE6B1E99A1);
+  constexpr uint64_t kPs328PixelShader =
+      UINT64_C(0x328FA02B07C392DC);
+  tokens.reserve(translated_ps328_guarded_candidate_count_);
+  for (size_t state_offset = 0;
+       state_offset < translated_replay_token_states_.size();
+       ++state_offset) {
+    const TranslatedReplayTokenState &state =
+        translated_replay_token_states_[state_offset];
+    const NativeGuestTranslatedReplayTokenContext &token =
+        state.public_context;
+    if (token.vertex_shader_hash != kPs328VertexShader ||
+        token.pixel_shader_hash != kPs328PixelShader ||
+        !state.ps328_resources_guarded) {
+      continue;
+    }
+    if (!token.valid) {
+      return query_failure(QueryFailure::kStateTokenInvalid,
+                           state_offset);
+    }
+    if (!token.resources_stable_for_deferred_replay) {
+      return query_failure(QueryFailure::kStateTokenNotStable,
+                           state_offset);
+    }
+    if (token.backend_frame_sequence != backend_frame_sequence) {
+      return query_failure(QueryFailure::kStateTokenFrameMismatch,
+                           state_offset);
+    }
+    if (state.frame != backend_frame_sequence) {
+      return query_failure(QueryFailure::kStateFrameMismatch,
+                           state_offset);
+    }
+    if (state.opaque_token != token.opaque_token) {
+      return query_failure(QueryFailure::kStateOpaqueTokenMismatch,
+                           state_offset);
+    }
+    if (state.ps328_guest_ranges.empty()) {
+      return query_failure(QueryFailure::kStateGuestRangesMissing,
+                           state_offset);
+    }
+    if (state.ps328_texture_resources.size() != 2) {
+      return query_failure(
+          QueryFailure::kStateTexturePayloadCount, state_offset);
+    }
+    tokens.push_back(token);
+  }
+  if (tokens.size() != translated_ps328_guarded_candidate_count_) {
+    return query_failure(QueryFailure::kReturnedCountMismatch,
+                         kNoStateOffset);
+  }
+  translated_ps328_query_failure_signature_ = UINT64_MAX;
+  return true;
+}
+
+bool VulkanCommandProcessor::ProveGuardedFullOutputNormalization(
+    const std::vector<GuardedReplayNormalizationEvidence> &evidence,
+    NativeGuestGuardedReplayPacket &packet) const {
+  const auto prove_full_output_normalization =
+      [&](const std::vector<GuardedReplayNormalizationEvidence> &evidence) {
+        constexpr uint32_t kOutputWidth = 1280;
+        constexpr uint32_t kOutputHeight = 720;
+        constexpr size_t kFloat3Bytes = sizeof(float) * 3;
+        const auto ordered_float_bits = [](float value) {
+          const uint32_t bits = std::bit_cast<uint32_t>(value);
+          return bits & 0x80000000u ? ~bits
+                                    : bits | UINT32_C(0x80000000);
+        };
+        const auto float_within_ulps =
+            [&](float left, float right, uint32_t maximum_ulps = 2) {
+              if (!std::isfinite(left) || !std::isfinite(right)) {
+                return false;
+              }
+              const uint32_t left_ordered = ordered_float_bits(left);
+              const uint32_t right_ordered = ordered_float_bits(right);
+              const uint32_t distance =
+                  left_ordered > right_ordered
+                      ? left_ordered - right_ordered
+                      : right_ordered - left_ordered;
+              return distance <= maximum_ulps;
+            };
+        struct TileAffine {
+          std::array<float, 2> slope{};
+          std::array<float, 2> intercept_twice{};
+        };
+        const auto calculate_affine =
+            [](const GuardedReplayTileDynamicState &state) {
+              TileAffine affine;
+              for (size_t axis = 0; axis < 2; ++axis) {
+                const float origin = state.viewport[axis];
+                const float extent = state.viewport[axis + 2];
+                affine.slope[axis] = extent * state.ndc_scale[axis];
+                affine.intercept_twice[axis] =
+                    origin * 2.0f +
+                    extent * (state.ndc_offset[axis] + 1.0f);
+              }
+              return affine;
+            };
+        if (packet.tokens.empty() ||
+            evidence.size() != packet.tokens.size()) {
+          return false;
+        }
+        packet.normalized_tokens.clear();
+        packet.normalized_tokens.reserve(packet.tokens.size());
+        for (size_t logical_offset = 0;
+             logical_offset < evidence.size(); ++logical_offset) {
+          const GuardedReplayNormalizationEvidence &tiles =
+              evidence[logical_offset];
+          const GuardedReplayTileDynamicState &first = tiles[0];
+          if (!first.valid ||
+              first.system_constants.empty() ||
+              first.system_constants_mechanical_mask.size() !=
+                  first.system_constants.size()) {
+            return false;
+          }
+          const uint32_t scale_offset =
+              first.system_constants_ndc_scale_byte_offset;
+          const uint32_t offset_offset =
+              first.system_constants_ndc_offset_byte_offset;
+          if (uint64_t(scale_offset) + kFloat3Bytes >
+                  first.system_constants.size() ||
+              uint64_t(offset_offset) + kFloat3Bytes >
+                  first.system_constants.size() ||
+              (scale_offset < offset_offset + kFloat3Bytes &&
+               offset_offset < scale_offset + kFloat3Bytes)) {
+            return false;
+          }
+          uint32_t cumulative_height = 0;
+          const TileAffine first_affine = calculate_affine(first);
+          for (size_t tile_index = 0; tile_index < tiles.size();
+               ++tile_index) {
+            const GuardedReplayTileDynamicState &tile =
+                tiles[tile_index];
+            if (!tile.valid ||
+                tile.system_constants.size() !=
+                    first.system_constants.size() ||
+                tile.system_constants_mechanical_mask !=
+                    first.system_constants_mechanical_mask ||
+                tile.system_constants_ndc_scale_byte_offset !=
+                    scale_offset ||
+                tile.system_constants_ndc_offset_byte_offset !=
+                    offset_offset ||
+                std::memcmp(tile.system_constants.data() + scale_offset,
+                            tile.ndc_scale.data(), kFloat3Bytes) != 0 ||
+                std::memcmp(tile.system_constants.data() + offset_offset,
+                            tile.ndc_offset.data(), kFloat3Bytes) != 0 ||
+                !std::ranges::all_of(
+                    tile.viewport,
+                    [](float value) { return std::isfinite(value); }) ||
+                tile.viewport[2] <= 0.0f ||
+                tile.viewport[3] <= 0.0f ||
+                tile.scissor_offset != std::array<int32_t, 2>{0, 0} ||
+                tile.scissor_extent[0] != kOutputWidth ||
+                tile.scissor_extent[1] == 0 ||
+                cumulative_height > kOutputHeight ||
+                tile.scissor_extent[1] >
+                    kOutputHeight - cumulative_height ||
+                !float_within_ulps(tile.viewport[0], 0.0f) ||
+                !float_within_ulps(tile.viewport[1], 0.0f) ||
+                !float_within_ulps(tile.viewport[2],
+                                   float(kOutputWidth)) ||
+                !float_within_ulps(
+                    tile.viewport[3],
+                    float(kOutputHeight - cumulative_height)) ||
+                !float_within_ulps(tile.viewport[4],
+                                   first.viewport[4]) ||
+                !float_within_ulps(tile.viewport[5],
+                                   first.viewport[5]) ||
+                !float_within_ulps(tile.ndc_scale[2],
+                                   first.ndc_scale[2]) ||
+                !float_within_ulps(tile.ndc_offset[2],
+                                   first.ndc_offset[2])) {
+              return false;
+            }
+            for (size_t byte = 0;
+                 byte < first.system_constants.size(); ++byte) {
+              if (tile.system_constants[byte] ==
+                  first.system_constants[byte]) {
+                continue;
+              }
+              const bool ndc_xy =
+                  (byte >= scale_offset &&
+                   byte < scale_offset + sizeof(float) * 2) ||
+                  (byte >= offset_offset &&
+                   byte < offset_offset + sizeof(float) * 2);
+              if (!ndc_xy ||
+                  tile.system_constants_mechanical_mask[byte] == 0) {
+                return false;
+              }
+            }
+            const TileAffine affine = calculate_affine(tile);
+            for (size_t axis = 0; axis < 2; ++axis) {
+              if (!float_within_ulps(affine.slope[axis],
+                                     first_affine.slope[axis])) {
+                return false;
+              }
+            }
+            if (!float_within_ulps(
+                    affine.intercept_twice[0],
+                    first_affine.intercept_twice[0])) {
+              return false;
+            }
+            const float derived_global_y =
+                (first_affine.intercept_twice[1] -
+                 affine.intercept_twice[1]) *
+                0.5f;
+            if (!float_within_ulps(
+                    derived_global_y, float(cumulative_height))) {
+              return false;
+            }
+            cumulative_height += tile.scissor_extent[1];
+          }
+          if (cumulative_height != kOutputHeight) {
+            return false;
+          }
+          const NativeGuestTranslatedReplayTokenContext &raw =
+              packet.tokens[logical_offset];
+          if (std::memcmp(raw.viewport.data(), first.viewport.data(),
+                          sizeof(raw.viewport)) != 0 ||
+              raw.ndc_scale != first.ndc_scale ||
+              raw.ndc_offset != first.ndc_offset ||
+              raw.scissor_offset != first.scissor_offset ||
+              raw.scissor_extent != first.scissor_extent ||
+              raw.system_constants != first.system_constants ||
+              raw.system_constants_mechanical_mask !=
+                  first.system_constants_mechanical_mask ||
+              raw.system_constants_ndc_scale_byte_offset !=
+                  scale_offset ||
+              raw.system_constants_ndc_offset_byte_offset !=
+                  offset_offset) {
+            return false;
+          }
+          NativeGuestTranslatedReplayTokenContext normalized = raw;
+          normalized.scissor_offset = {0, 0};
+          normalized.scissor_extent = {kOutputWidth, kOutputHeight};
+          packet.normalized_tokens.push_back(std::move(normalized));
+        }
+        packet.normalized_output_width = kOutputWidth;
+        packet.normalized_output_height = kOutputHeight;
+        packet.scissor_only_normalization = true;
+        packet.full_output_normalization_proven = true;
+        return true;
+      };
+  return prove_full_output_normalization(evidence);
+}
+
+bool VulkanCommandProcessor::GetCurrentFrameGuardedReplayPacket(
+    NativeGuestGuardedReplayFamily family,
+    uint64_t backend_frame_sequence,
+    NativeGuestGuardedReplayPacket &packet) const {
+  packet = {};
+  packet.family = family;
+  packet.backend_frame_sequence = backend_frame_sequence;
+  if (family == NativeGuestGuardedReplayFamily::kVenuePs328) {
+    if (!GetCurrentFrameGuardedPs328Tile1ReplayTokens(
+            backend_frame_sequence, packet.tokens)) {
+      return false;
+    }
+    if (!ProveGuardedFullOutputNormalization(
+            translated_ps328_normalization_evidence_, packet)) {
+      packet = {};
+      return false;
+    }
+    packet.three_blocks_exact = true;
+    packet.valid = true;
+    return true;
+  }
+  // `kGenericMain` is ambiguous by design: discovered families are addressed
+  // by index through the batch query, never by this enumerator.
+  if (family == NativeGuestGuardedReplayFamily::kUnknown ||
+      family == NativeGuestGuardedReplayFamily::kGenericMain) {
+    packet = {};
+    return false;
+  }
+  const auto found = std::ranges::find(
+      translated_guarded_families_, family,
+      [](const GuardedReplayFamilyEntry &entry) { return entry.spec.family; });
+  if (found == translated_guarded_families_.end()) {
+    packet = {};
+    return false;
+  }
+  return BuildGuardedReplayFamilyPacket(
+      size_t(found - translated_guarded_families_.begin()),
+      backend_frame_sequence, packet);
+}
+
+bool VulkanCommandProcessor::BuildGuardedReplayFamilyPacket(
+    size_t family_index, uint64_t backend_frame_sequence,
+    NativeGuestGuardedReplayPacket &packet) const {
+  packet = {};
+  if (family_index >= translated_guarded_families_.size()) {
+    return false;
+  }
+  const GuardedReplayFamilySpec &family_spec =
+      translated_guarded_families_[family_index].spec;
+  const GuardedReplayFamilyFrameState *family_state =
+      &translated_guarded_families_[family_index].state;
+  packet.family = family_spec.family;
+  packet.backend_frame_sequence = backend_frame_sequence;
+  if (backend_frame_sequence == 0 ||
+      backend_frame_sequence != frame_current_ ||
+      translated_replay_token_frame_ != frame_current_ ||
+      !submission_open_ ||
+      family_state->phase !=
+          GuardedReplayCandidatePhase::kProven ||
+      family_state->guarded_candidate_count == 0 ||
+      family_state->guarded_candidate_count !=
+          family_state->first_block_contracts.size()) {
+    packet = {};
+    return false;
+  }
+
+  packet.tokens.reserve(
+      family_state->guarded_candidate_count);
+  for (const TranslatedReplayTokenState &state :
+       translated_replay_token_states_) {
+    const NativeGuestTranslatedReplayTokenContext &token =
+        state.public_context;
+    if (!GuardedFamilySpecMatchesShaders(
+            family_spec, token.vertex_shader_hash,
+            token.pixel_shader_hash) ||
+        !state.ps328_resources_guarded) {
+      continue;
+    }
+    if (!token.valid ||
+        !token.resources_stable_for_deferred_replay ||
+        token.backend_frame_sequence != backend_frame_sequence ||
+        state.frame != backend_frame_sequence ||
+        state.opaque_token != token.opaque_token ||
+        state.ps328_guest_ranges.empty() ||
+        state.ps328_texture_resources.size() <
+            family_spec.minimum_unique_textures ||
+        state.ps328_texture_resources.size() >
+            family_spec.maximum_unique_textures) {
+      packet = {};
+      return false;
+    }
+    packet.tokens.push_back(token);
+  }
+  if (packet.tokens.size() !=
+      family_state->guarded_candidate_count) {
+    packet = {};
+    return false;
+  }
+  if (!ProveGuardedFullOutputNormalization(
+          family_state->normalization_evidence, packet)) {
+    packet = {};
+    return false;
+  }
+  packet.family = family_spec.family;
+  packet.backend_frame_sequence = backend_frame_sequence;
+  packet.three_blocks_exact = true;
+  packet.valid = true;
+  return true;
+}
+
+void VulkanCommandProcessor::EnsureGuardedReplayFamilySeeds() {
+  if (!translated_guarded_families_.empty()) {
+    return;
+  }
+  translated_guarded_families_.reserve(kGuardedNonPsFamilySpecs.size());
+  for (const GuardedReplayFamilySpec &spec : kGuardedNonPsFamilySpecs) {
+    translated_guarded_families_.push_back({.spec = spec, .state = {}});
+  }
+}
+
+void VulkanCommandProcessor::ResetGuardedReplayFamiliesForNewFrame() {
+  EnsureGuardedReplayFamilySeeds();
+  // Sampled once per frame rather than per draw, so the whole frame observes
+  // one consistent capture policy.
+  translated_generic_main_guard_enabled_ =
+      REXCVAR_GET(vulkan_generic_main_guarded_replay);
+  for (GuardedReplayFamilyEntry &entry : translated_guarded_families_) {
+    GuardedReplayFamilyFrameState &state = entry.state;
+    // These are process-lifetime milestone latches, not frame state. Resetting
+    // them here produced one expensive success line per gameplay frame after
+    // the family had already been proven.
+    const bool proven_logged = state.proven_diagnostic_logged;
+    const bool reject_logged = state.reject_diagnostic_logged;
+    const bool generation_logged = state.generation_diagnostic_logged;
+    const bool generation_reject_logged = state.generation_reject_logged;
+    // Abandonment accounting also spans frames: a discovered family earns its
+    // way out of generic capture by repeatedly failing the tile proof. A
+    // family that has ever proven is never abandoned, because a single frame
+    // without gameplay content must not retire a real MAIN family.
+    const bool ever_proven =
+        state.ever_proven ||
+        state.phase == GuardedReplayCandidatePhase::kProven;
+    const uint32_t unproven_frames =
+        state.phase == GuardedReplayCandidatePhase::kProven
+            ? 0
+            : state.consecutive_unproven_frames +
+                  (state.guarded_candidate_count != 0 ? 1u : 0u);
+    const bool abandoned =
+        state.abandoned ||
+        (!ever_proven &&
+         entry.spec.family == NativeGuestGuardedReplayFamily::kGenericMain &&
+         unproven_frames >= kGuardedGenericFamilyAbandonFrames);
+    if (abandoned && !state.abandoned) {
+      REXLOG_INFO(
+          "Generic MAIN guarded capture abandoned family "
+          "vs={:016X} ps={:016X} after {} unproven frames.",
+          entry.spec.vertex_shader_hashes[0], entry.spec.pixel_shader_hash,
+          unproven_frames);
+    }
+    state = {};
+    state.proven_diagnostic_logged = proven_logged;
+    state.reject_diagnostic_logged = reject_logged;
+    state.generation_diagnostic_logged = generation_logged;
+    state.generation_reject_logged = generation_reject_logged;
+    state.ever_proven = ever_proven;
+    state.consecutive_unproven_frames = unproven_frames;
+    state.abandoned = abandoned;
+  }
+  translated_generic_guarded_bytes_ = 0;
+}
+
+namespace {
+
+uint64_t PromotionHashBytes(uint64_t seed, const void *data, size_t size) {
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  uint64_t hash = seed;
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= UINT64_C(0x100000001B3);
+  }
+  return hash;
+}
+
+uint64_t PromotionHashValue(uint64_t seed, uint64_t value) {
+  return PromotionHashBytes(seed, &value, sizeof(value));
+}
+
+} // namespace
+
+void VulkanCommandProcessor::UpdateGuardedReplayFamilyPromotions() {
+  constexpr uint64_t kSeed = UINT64_C(0xCBF29CE484222325);
+  constexpr uint32_t kReportInterval = 60;
+  // Payload verification is a bounded diagnostic, not a per-frame budget the
+  // renderer must live within.
+  constexpr uint32_t kPromotionTexturePayloadMaxBytes = 4u * 1024 * 1024;
+  size_t payload_bytes_remaining = 16u * 1024 * 1024;
+  for (GuardedReplayFamilyEntry &entry : translated_guarded_families_) {
+    if (entry.state.phase != GuardedReplayCandidatePhase::kProven ||
+        entry.state.guarded_candidate_count == 0) {
+      continue;
+    }
+    std::vector<GuardedReplayFamilyPromotion::TokenFingerprint> fingerprints;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const PipelineLayout *pipeline_layout = nullptr;
+    for (const TranslatedReplayTokenState &state :
+         translated_replay_token_states_) {
+      const NativeGuestTranslatedReplayTokenContext &token =
+          state.public_context;
+      if (!GuardedFamilySpecMatchesShaders(entry.spec,
+                                           token.vertex_shader_hash,
+                                           token.pixel_shader_hash) ||
+          !state.ps328_resources_guarded) {
+        continue;
+      }
+      if (pipeline == VK_NULL_HANDLE) {
+        pipeline = state.pipeline;
+        pipeline_layout = state.pipeline_layout;
+      }
+      GuardedReplayFamilyPromotion::TokenFingerprint fingerprint;
+      // Geometry: the vertex/index bytes a cached upload would own.
+      fingerprint.geometry = PromotionHashValue(kSeed, token.indexed ? 1 : 0);
+      fingerprint.geometry = PromotionHashValue(
+          fingerprint.geometry, token.host_vertex_or_index_count);
+      for (const TranslatedReplayTokenState::StableGuestRange &range :
+           state.ps328_guest_ranges) {
+        fingerprint.geometry =
+            PromotionHashValue(fingerprint.geometry, range.address);
+        if (range.bytes) {
+          fingerprint.geometry = PromotionHashBytes(
+              fingerprint.geometry, range.bytes->data(), range.bytes->size());
+        }
+      }
+      // Textures: identity plus the backend's own content generation, which
+      // is what a persistent texture cache would key on.
+      fingerprint.texture_identity = kSeed;
+      for (const auto &texture : state.ps328_texture_resources) {
+        fingerprint.texture_identity = PromotionHashValue(
+            fingerprint.texture_identity, texture.texture_key_hash);
+        fingerprint.texture_identity = PromotionHashValue(
+            fingerprint.texture_identity, texture.base_address);
+        // Hash the actual guest texels behind this binding and compare with
+        // what they were last time this exact range was seen. Bounded per
+        // frame so the diagnostic cannot become the cost it is measuring.
+        if (texture.base_address != 0 && texture.base_length != 0 &&
+            texture.base_length <= kPromotionTexturePayloadMaxBytes &&
+            payload_bytes_remaining >= texture.base_length) {
+          std::vector<uint8_t> texels;
+          if (shared_memory_->CopyGuestBytes(texture.base_address,
+                                             texture.base_length, texels)) {
+            payload_bytes_remaining -= texture.base_length;
+            const uint64_t key = PromotionHashValue(
+                PromotionHashValue(kSeed, texture.base_address),
+                texture.base_length);
+            const uint64_t payload =
+                PromotionHashBytes(kSeed, texels.data(), texels.size());
+            const auto existing =
+                promotion_texture_payload_hashes_.find(key);
+            if (existing != promotion_texture_payload_hashes_.end()) {
+              ++promotion_texture_payload_checked_;
+              if (existing->second == payload) {
+                ++promotion_texture_payload_identical_;
+              }
+              existing->second = payload;
+            } else {
+              promotion_texture_payload_hashes_.emplace(key, payload);
+            }
+          }
+        }
+      }
+      fingerprint.textures = fingerprint.texture_identity;
+      for (const auto &texture : state.ps328_texture_resources) {
+        fingerprint.textures = PromotionHashValue(fingerprint.textures,
+                                                  texture.content_generation);
+      }
+      // Constants: expected to move every frame (camera, transforms). Cheap to
+      // re-upload; the point is to confirm the cost is isolated here.
+      fingerprint.constants =
+          PromotionHashBytes(kSeed, token.system_constants.data(),
+                             token.system_constants.size());
+      fingerprints.push_back(fingerprint);
+    }
+    if (fingerprints.empty()) {
+      continue;
+    }
+
+    GuardedReplayFamilyPromotion &promotion = entry.promotion;
+    if (!promotion.valid) {
+      promotion.valid = true;
+      promotion.pipeline = pipeline;
+      promotion.pipeline_layout = pipeline_layout;
+      promotion.tokens = std::move(fingerprints);
+      promotion.frames_observed = 1;
+      continue;
+    }
+    ++promotion.frames_observed;
+    if (promotion.pipeline != pipeline ||
+        promotion.pipeline_layout != pipeline_layout) {
+      ++promotion.frames_pipeline_changed;
+    }
+    if (promotion.tokens.size() != fingerprints.size()) {
+      ++promotion.frames_count_changed;
+    } else {
+      bool geometry_changed = false;
+      bool texture_identity_changed = false;
+      bool textures_changed = false;
+      bool constants_changed = false;
+      for (size_t i = 0; i < fingerprints.size(); ++i) {
+        geometry_changed |=
+            promotion.tokens[i].geometry != fingerprints[i].geometry;
+        texture_identity_changed |= promotion.tokens[i].texture_identity !=
+                                    fingerprints[i].texture_identity;
+        textures_changed |=
+            promotion.tokens[i].textures != fingerprints[i].textures;
+        constants_changed |=
+            promotion.tokens[i].constants != fingerprints[i].constants;
+      }
+      promotion.frames_geometry_changed += geometry_changed ? 1 : 0;
+      promotion.frames_texture_identity_changed +=
+          texture_identity_changed ? 1 : 0;
+      promotion.frames_textures_changed += textures_changed ? 1 : 0;
+      promotion.frames_constants_changed += constants_changed ? 1 : 0;
+    }
+    promotion.pipeline = pipeline;
+    promotion.pipeline_layout = pipeline_layout;
+    promotion.tokens = std::move(fingerprints);
+
+    if (promotion.frames_observed - promotion.last_reported_frames >=
+        kReportInterval) {
+      promotion.last_reported_frames = promotion.frames_observed;
+      REXLOG_INFO(
+          "Guarded family promotion stability vs={:016X} ps={:016X} draws={} "
+          "frames={} pipeline_changed={} count_changed={} geometry_changed={} "
+          "texture_identity_changed={} textures_changed={} "
+          "constants_changed={}",
+          entry.spec.vertex_shader_hashes[0], entry.spec.pixel_shader_hash,
+          promotion.tokens.size(), promotion.frames_observed,
+          promotion.frames_pipeline_changed, promotion.frames_count_changed,
+          promotion.frames_geometry_changed,
+          promotion.frames_texture_identity_changed,
+          promotion.frames_textures_changed,
+          promotion.frames_constants_changed);
+    }
+  }
+  ReportGuardedTexturePayloadStability();
+}
+
+void VulkanCommandProcessor::ReportGuardedTexturePayloadStability() {
+  constexpr uint64_t kReportInterval = 20000;
+  if (promotion_texture_payload_checked_ -
+          promotion_texture_payload_reported_ <
+      kReportInterval) {
+    return;
+  }
+  promotion_texture_payload_reported_ = promotion_texture_payload_checked_;
+  REXLOG_INFO(
+      "Guarded texture payload stability: rebinds={} identical_bytes={} "
+      "identical_pct={:.2f} distinct_ranges={}",
+      promotion_texture_payload_checked_,
+      promotion_texture_payload_identical_,
+      promotion_texture_payload_checked_ > 0
+          ? 100.0 * double(promotion_texture_payload_identical_) /
+                double(promotion_texture_payload_checked_)
+          : 0.0,
+      promotion_texture_payload_hashes_.size());
+}
+
+size_t VulkanCommandProcessor::FindGuardedReplayFamilyIndex(
+    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) const {
+  const auto found = std::ranges::find_if(
+      translated_guarded_families_,
+      [&](const GuardedReplayFamilyEntry &entry) {
+        return GuardedFamilySpecMatchesShaders(
+            entry.spec, vertex_shader_hash, pixel_shader_hash);
+      });
+  return found == translated_guarded_families_.end()
+             ? translated_guarded_families_.size()
+             : size_t(found - translated_guarded_families_.begin());
+}
+
+size_t VulkanCommandProcessor::FindOrCreateGuardedReplayFamilyIndex(
+    uint64_t vertex_shader_hash, uint64_t pixel_shader_hash) {
+  EnsureGuardedReplayFamilySeeds();
+  const size_t existing =
+      FindGuardedReplayFamilyIndex(vertex_shader_hash, pixel_shader_hash);
+  if (existing != translated_guarded_families_.size()) {
+    return existing;
+  }
+  if (!translated_generic_main_guard_enabled_ ||
+      translated_guarded_families_.size() >=
+          NativeGuestGuardedMainReplayBatch::kMaximumFamilies) {
+    if (translated_generic_main_guard_enabled_ &&
+        !translated_generic_family_budget_logged_) {
+      translated_generic_family_budget_logged_ = true;
+      REXLOG_INFO(
+          "Generic MAIN guarded capture reached its {} family budget; "
+          "further shader pairs are observed but not guarded.",
+          uint32_t(NativeGuestGuardedMainReplayBatch::kMaximumFamilies));
+    }
+    return translated_guarded_families_.size();
+  }
+  GuardedReplayFamilySpec spec = kGuardedGenericFamilySpec;
+  spec.vertex_shader_hashes = {vertex_shader_hash, 0};
+  spec.vertex_shader_count = 1;
+  spec.pixel_shader_hash = pixel_shader_hash;
+  translated_guarded_families_.push_back({.spec = spec, .state = {}});
+  return translated_guarded_families_.size() - 1;
+}
+
+bool VulkanCommandProcessor::GetCurrentFrameGuardedMainReplayBatch(
+    uint64_t backend_frame_sequence,
+    NativeGuestGuardedMainReplayBatch &batch) const {
+  batch = {};
+  if (backend_frame_sequence == 0 ||
+      backend_frame_sequence != frame_current_ ||
+      translated_replay_token_frame_ != frame_current_ ||
+      !submission_open_) {
+    return false;
+  }
+  batch.backend_frame_sequence = backend_frame_sequence;
+  batch.normalized_output_width = 1280;
+  batch.normalized_output_height = 720;
+  batch.scissor_only_normalization = true;
+  batch.full_output_normalization_proven = true;
+
+  // PS328 keeps its original proof path, then joins the same plan as any
+  // discovered family.
+  struct PendingFamily {
+    NativeGuestGuardedReplayFamily family =
+        NativeGuestGuardedReplayFamily::kUnknown;
+    uint64_t vertex_shader_hash = 0;
+    uint64_t pixel_shader_hash = 0;
+    uint32_t observed_token_count = 0;
+    uint32_t phase = 0;
+    NativeGuestGuardedReplayPacket packet;
+    uint32_t reject_mask = kNativeGuestGuardedMainFamilyRejectNone;
+  };
+  std::vector<PendingFamily> pending;
+  pending.reserve(translated_guarded_families_.size() + 1);
+
+  {
+    PendingFamily ps328;
+    ps328.family = NativeGuestGuardedReplayFamily::kVenuePs328;
+    ps328.vertex_shader_hash = kGuardedPs328VertexShader;
+    ps328.pixel_shader_hash = kGuardedPs328PixelShader;
+    ps328.observed_token_count = translated_ps328_guarded_candidate_count_;
+    ps328.phase = uint32_t(translated_ps328_candidate_phase_);
+    if (!GetCurrentFrameGuardedReplayPacket(
+            NativeGuestGuardedReplayFamily::kVenuePs328,
+            backend_frame_sequence, ps328.packet) ||
+        !ps328.packet.valid) {
+      ps328.packet = {};
+      ps328.reject_mask =
+          translated_ps328_candidate_phase_ ==
+                  GuardedReplayCandidatePhase::kProven
+              ? kNativeGuestGuardedMainFamilyRejectResourcesNotStable
+              : kNativeGuestGuardedMainFamilyRejectUnproven;
+    }
+    pending.push_back(std::move(ps328));
+  }
+
+  for (size_t family_index = 0;
+       family_index < translated_guarded_families_.size(); ++family_index) {
+    const GuardedReplayFamilyEntry &entry =
+        translated_guarded_families_[family_index];
+    if (entry.state.abandoned) {
+      continue;
+    }
+    PendingFamily candidate;
+    candidate.family = entry.spec.family;
+    candidate.vertex_shader_hash = entry.spec.vertex_shader_hashes[0];
+    candidate.pixel_shader_hash = entry.spec.pixel_shader_hash;
+    candidate.observed_token_count = entry.state.guarded_candidate_count;
+    candidate.phase = uint32_t(entry.state.phase);
+    if (candidate.observed_token_count == 0) {
+      continue;
+    }
+    if (!BuildGuardedReplayFamilyPacket(
+            family_index, backend_frame_sequence, candidate.packet) ||
+        !candidate.packet.valid) {
+      candidate.packet = {};
+      candidate.reject_mask =
+          entry.state.phase == GuardedReplayCandidatePhase::kProven
+              ? kNativeGuestGuardedMainFamilyRejectResourcesNotStable
+          : entry.state.phase == GuardedReplayCandidatePhase::kRejected
+              ? kNativeGuestGuardedMainFamilyRejectSemanticTileState
+              : kNativeGuestGuardedMainFamilyRejectUnproven;
+    }
+    pending.push_back(std::move(candidate));
+  }
+
+  // The plan's attachment signature is the one the private MAIN target will be
+  // built from. It is taken from the lowest-ordinal proven token so it is
+  // derived from observed guest state, never chosen.
+  const NativeGuestTranslatedReplayTokenContext *signature = nullptr;
+  uint64_t signature_token = UINT64_MAX;
+  for (const PendingFamily &candidate : pending) {
+    if (candidate.packet.normalized_tokens.empty()) {
+      continue;
+    }
+    for (const NativeGuestTranslatedReplayTokenContext &token :
+         candidate.packet.normalized_tokens) {
+      if (token.opaque_token != 0 && token.opaque_token < signature_token) {
+        signature_token = token.opaque_token;
+        signature = &token;
+      }
+    }
+  }
+
+  const auto attachment_matches =
+      [&](const NativeGuestTranslatedReplayTokenContext &token) {
+        return signature != nullptr &&
+               token.color_attachment_count ==
+                   signature->color_attachment_count &&
+               token.color_attachment_formats ==
+                   signature->color_attachment_formats &&
+               token.depth_attachment_format ==
+                   signature->depth_attachment_format &&
+               token.stencil_attachment_format ==
+                   signature->stencil_attachment_format &&
+               token.sample_count == signature->sample_count &&
+               token.sample_mask == signature->sample_mask &&
+               token.dynamic_rendering == signature->dynamic_rendering;
+      };
+
+  for (PendingFamily &candidate : pending) {
+    batch.observed_token_count += candidate.observed_token_count;
+    NativeGuestGuardedMainFamilySummary summary;
+    summary.family = candidate.family;
+    summary.vertex_shader_hash = candidate.vertex_shader_hash;
+    summary.pixel_shader_hash = candidate.pixel_shader_hash;
+    summary.observed_token_count = candidate.observed_token_count;
+    summary.phase = candidate.phase;
+    summary.reject_mask = candidate.reject_mask;
+    const auto publish = [&]() {
+      if (batch.families.size() <
+          NativeGuestGuardedMainReplayBatch::kMaximumFamilies) {
+        batch.families.push_back(summary);
+        ++batch.discovered_family_count;
+      }
+    };
+    if (candidate.packet.normalized_tokens.empty()) {
+      publish();
+      continue;
+    }
+    ++batch.proven_family_count;
+    if (!std::ranges::all_of(candidate.packet.normalized_tokens,
+                             attachment_matches)) {
+      summary.reject_mask |=
+          kNativeGuestGuardedMainFamilyRejectAttachmentMismatch;
+      publish();
+      continue;
+    }
+    if (batch.ordered_tokens.size() +
+            candidate.packet.normalized_tokens.size() >
+        NativeGuestGuardedMainReplayBatch::kMaximumTokens) {
+      summary.reject_mask |= kNativeGuestGuardedMainFamilyRejectTokenBudget;
+      publish();
+      continue;
+    }
+    for (uint32_t offset = 0;
+         offset < candidate.packet.normalized_tokens.size(); ++offset) {
+      batch.ordered_tokens.push_back({
+          .family = candidate.family,
+          .family_offset = offset,
+          .vertex_shader_hash = candidate.vertex_shader_hash,
+          .pixel_shader_hash = candidate.pixel_shader_hash,
+          .token = candidate.packet.normalized_tokens[offset],
+      });
+    }
+    summary.replayed_token_count =
+        uint32_t(candidate.packet.normalized_tokens.size());
+    publish();
+  }
+
+  std::ranges::sort(
+      batch.ordered_tokens, {},
+      [](const NativeGuestGuardedReplayBatchToken &entry) {
+        return entry.token.opaque_token;
+      });
+  uint64_t previous_token = 0;
+  for (const NativeGuestGuardedReplayBatchToken &entry :
+       batch.ordered_tokens) {
+    if (entry.token.opaque_token == 0 ||
+        entry.token.opaque_token <= previous_token) {
+      batch = {};
+      return false;
+    }
+    previous_token = entry.token.opaque_token;
+  }
+  batch.covered_token_count = uint32_t(batch.ordered_tokens.size());
+  // `valid` means "there is a plan to replay". The query still succeeds with
+  // no plan, because the per-family summaries are exactly the diagnostic
+  // needed while families are still failing their proofs.
+  batch.valid = !batch.ordered_tokens.empty();
+  return true;
+}
+
+void VulkanCommandProcessor::
+    InvalidateGraphicsStateAfterTranslatedReplay() {
+  // Direct replay changes the Vulkan graphics pipeline, descriptor sets,
+  // index buffer and every dynamic state without going through the guest or
+  // NRHI binding caches. Invalidate both command-processor binding layers,
+  // including the adjacent-draw fast path that was previously left valid.
+  current_render_pass_ = VK_NULL_HANDLE;
+  current_framebuffer_ = nullptr;
+  in_render_pass_ = false;
+  current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+  current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+  current_guest_graphics_pipeline_layout_ = nullptr;
+  current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+  current_graphics_descriptor_set_values_up_to_date_ = 0;
+  current_constant_buffers_up_to_date_ = 0;
+  std::memset(current_graphics_descriptor_sets_, 0,
+              sizeof(current_graphics_descriptor_sets_));
+  std::memset(current_float_constant_map_vertex_, 0,
+              sizeof(current_float_constant_map_vertex_));
+  std::memset(current_float_constant_map_pixel_, 0,
+              sizeof(current_float_constant_map_pixel_));
+  current_graphics_descriptor_sets_
+      [SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] =
+          shared_memory_and_edram_descriptor_set_;
+  current_graphics_descriptor_set_values_up_to_date_ =
+      UINT32_C(1)
+      << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+  current_texture_descriptor_set_hash_valid_[0] = false;
+  current_texture_descriptor_set_hash_valid_[1] = false;
+  draw_binding_state_valid_ = false;
+  draw_binding_submission_ = 0;
+  draw_binding_vertex_shader_ = nullptr;
+  draw_binding_pixel_shader_ = nullptr;
+  draw_binding_texture_generation_ = 0;
+  texture_bindings_unchanged_this_draw_ = false;
+  current_samplers_vertex_.clear();
+  current_samplers_pixel_.clear();
+  dynamic_viewport_update_needed_ = true;
+  dynamic_scissor_update_needed_ = true;
+  dynamic_depth_bias_update_needed_ = true;
+  dynamic_blend_constants_update_needed_ = true;
+  dynamic_stencil_compare_mask_front_update_needed_ = true;
+  dynamic_stencil_compare_mask_back_update_needed_ = true;
+  dynamic_stencil_write_mask_front_update_needed_ = true;
+  dynamic_stencil_write_mask_back_update_needed_ = true;
+  dynamic_stencil_reference_front_update_needed_ = true;
+  dynamic_stencil_reference_back_update_needed_ = true;
+}
+
+NativeGuestTranslatedReplayResult
+VulkanCommandProcessor::ReplayNativeGuestTranslatedDraw(
+    const NativeGuestOutputRenderContext& output_context,
+    const NativeGuestTranslatedReplayTokenContext& token,
+    const NativeGuestTranslatedReplayTarget& target) {
+  if (output_context.backend != NativeGuestOutputBackend::kVulkan ||
+      output_context.device == nullptr ||
+      output_context.device != native_rhi_device_ || !submission_open_) {
+    return NativeGuestTranslatedReplayResult::kInvalidContext;
+  }
+  if (!token.valid || token.backend != NativeGuestOutputBackend::kVulkan ||
+      token.opaque_token == 0 || token.backend_frame_sequence == 0) {
+    return NativeGuestTranslatedReplayResult::kInvalidToken;
+  }
+  if (token.backend_frame_sequence != frame_current_ ||
+      translated_replay_token_frame_ != frame_current_) {
+    return NativeGuestTranslatedReplayResult::kExpiredToken;
+  }
+
+  const TranslatedReplayTokenState* token_state = nullptr;
+  for (const TranslatedReplayTokenState& candidate :
+       translated_replay_token_states_) {
+    if (candidate.opaque_token == token.opaque_token &&
+        candidate.frame == token.backend_frame_sequence) {
+      token_state = &candidate;
+      break;
+    }
+  }
+  if (token_state == nullptr ||
+      token_state->public_context.vertex_shader_hash !=
+          token.vertex_shader_hash ||
+      token_state->public_context.pixel_shader_hash !=
+          token.pixel_shader_hash ||
+      token_state->public_context.vertex_shader_modification !=
+          token.vertex_shader_modification ||
+      token_state->public_context.pixel_shader_modification !=
+          token.pixel_shader_modification) {
+    return NativeGuestTranslatedReplayResult::kInvalidToken;
+  }
+
+  constexpr uint32_t kSetSharedMemoryAndEdram =
+      SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+  constexpr uint32_t kSetConstants =
+      SpirvShaderTranslator::kDescriptorSetConstants;
+  constexpr uint32_t kRequiredBaseSetMask =
+      (uint32_t(1) << kSetSharedMemoryAndEdram) |
+      (uint32_t(1) << kSetConstants);
+  constexpr uint32_t kAllConstantBufferMask =
+      (uint32_t(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
+  if (token_state->pipeline == VK_NULL_HANDLE ||
+      token_state->pipeline_layout == nullptr ||
+      token_state->pipeline_layout->GetPipelineLayout() == VK_NULL_HANDLE ||
+      (token.descriptor_set_valid_mask & kRequiredBaseSetMask) !=
+          kRequiredBaseSetMask ||
+      (token.constant_buffer_valid_mask & kAllConstantBufferMask) !=
+          kAllConstantBufferMask ||
+      token_state->descriptor_sets[kSetSharedMemoryAndEdram] ==
+          VK_NULL_HANDLE ||
+      (!token_state->constants_push_descriptors &&
+       token_state->descriptor_sets[kSetConstants] == VK_NULL_HANDLE) ||
+      (token.indexed && token_state->index_buffer == VK_NULL_HANDLE)) {
+    return NativeGuestTranslatedReplayResult::kIncompleteBindings;
+  }
+  if (!token.dynamic_rendering || !token_state->dynamic_rendering ||
+      token.color_attachment_count != 1 ||
+      token.color_attachment_formats[0] == nrhi::Format::kUnknown ||
+      token.sample_count == 0 || token.host_vertex_or_index_count == 0) {
+    return NativeGuestTranslatedReplayResult::kUnsupportedDraw;
+  }
+
+  const bool token_has_depth =
+      token.depth_attachment_format != nrhi::Format::kUnknown;
+  if (target.color == nullptr || target.color == output_context.guest_output ||
+      target.width == 0 || target.height == 0 ||
+      target.color_format != token.color_attachment_formats[0] ||
+      target.sample_count != token.sample_count ||
+      (target.depth_stencil != nullptr) != token_has_depth ||
+      (token_has_depth &&
+       (target.depth_stencil_format != token.depth_attachment_format ||
+        token.stencil_attachment_format != token.depth_attachment_format)) ||
+      !std::isfinite(target.clear_depth_value) ||
+      target.clear_depth_value < 0.0f || target.clear_depth_value > 1.0f ||
+      !std::all_of(target.clear_color_value.begin(),
+                   target.clear_color_value.end(),
+                   [](float value) { return std::isfinite(value); })) {
+    return NativeGuestTranslatedReplayResult::kIncompatibleTarget;
+  }
+
+  // A token is not a content snapshot merely because its Vulkan handles live
+  // for the frame. Only the phase-zero rectangle currently installs a
+  // page-watch before vertex residency and stores its generation in the
+  // private token. Everything else remains fail-closed.
+  if (!token.resources_stable_for_deferred_replay ||
+      !token_state->public_context.resources_stable_for_deferred_replay) {
+    return NativeGuestTranslatedReplayResult::kResourcesNotStable;
+  }
+  // A discovered family validates against the budgets it was admitted under,
+  // exactly as the four seeded families do. The lookup is over the live table
+  // rather than the seed array so generic families are covered too.
+  const size_t guarded_family_index = FindGuardedReplayFamilyIndex(
+      token.vertex_shader_hash, token.pixel_shader_hash);
+  const bool ps328_guarded_payload =
+      token_state->ps328_resources_guarded &&
+      ((token.vertex_shader_hash == kGuardedPs328VertexShader &&
+        token.pixel_shader_hash == kGuardedPs328PixelShader) ||
+       guarded_family_index != translated_guarded_families_.size());
+  const size_t guarded_texture_count =
+      token_state->ps328_texture_resources.size();
+  bool ps328_payload_texture_count_valid = false;
+  if (token.vertex_shader_hash == kGuardedPs328VertexShader) {
+    ps328_payload_texture_count_valid = guarded_texture_count == 2;
+  } else if (guarded_family_index != translated_guarded_families_.size()) {
+    const GuardedReplayFamilySpec &spec =
+        translated_guarded_families_[guarded_family_index].spec;
+    ps328_payload_texture_count_valid =
+        guarded_texture_count >= spec.minimum_unique_textures &&
+        guarded_texture_count <= spec.maximum_unique_textures;
+  }
+  const auto ps328_ranges_unchanged = [&]() {
+    if (!ps328_guarded_payload ||
+        token_state->ps328_guest_ranges.empty() ||
+        !ps328_payload_texture_count_valid ||
+        !token.resource_contents_valid ||
+        token.texture_resources !=
+            token_state->public_context.texture_resources ||
+        token.sampler_resources !=
+            token_state->public_context.sampler_resources) {
+      return false;
+    }
+    return std::all_of(
+        token_state->ps328_guest_ranges.begin(),
+        token_state->ps328_guest_ranges.end(),
+        [&](const TranslatedReplayTokenState::StableGuestRange &range) {
+          return range.address != 0 && range.bytes &&
+                 !range.bytes->empty() &&
+                 shared_memory_->RequestRangeIfBytesEqual(
+                     range.address, uint32_t(range.bytes->size()),
+                     range.bytes->data());
+        });
+  };
+  if (ps328_guarded_payload && !ps328_ranges_unchanged()) {
+    return NativeGuestTranslatedReplayResult::kResourcesNotStable;
+  }
+
+  const auto rectangle_guard_intact = [&]() {
+    return token_state->rectangle_guarded &&
+           translated_rectangle_guard_active_.load(
+               std::memory_order_acquire) &&
+           translated_rectangle_guard_generation_.load(
+               std::memory_order_acquire) ==
+               token_state->rectangle_guard_generation;
+  };
+  const auto refresh_unchanged_rectangle = [&]() {
+    return token_state->rectangle_vertex_snapshot_valid &&
+           shared_memory_->RequestRangeIfBytesEqual(
+               token_state->rectangle_vertex_address,
+               uint32_t(token_state->rectangle_vertex_bytes.size()),
+               token_state->rectangle_vertex_bytes.data());
+  };
+  bool guarded_payload = false;
+  if (!ps328_guarded_payload) {
+    guarded_payload = rectangle_guard_intact();
+    if (!guarded_payload) {
+      if (translated_rectangle_last_gpu_invalidation_generation_.load(
+              std::memory_order_acquire) >
+              token_state->rectangle_guard_generation ||
+          !refresh_unchanged_rectangle()) {
+        return NativeGuestTranslatedReplayResult::kResourcesNotStable;
+      }
+    }
+  }
+  if (!NativeRhiCanBeginTranslatedReplayScope(
+          output_context.device, target.color, target.depth_stencil,
+          target.color_format, target.depth_stencil_format, target.width,
+          target.height, target.sample_count,
+          target.clear_color_value.data())) {
+    return NativeGuestTranslatedReplayResult::kRenderScopeUnavailable;
+  }
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+  if (!ps328_guarded_payload && guarded_payload &&
+      !rectangle_guard_intact()) {
+    if (translated_rectangle_last_gpu_invalidation_generation_.load(
+            std::memory_order_acquire) >
+            token_state->rectangle_guard_generation ||
+        !refresh_unchanged_rectangle()) {
+      return NativeGuestTranslatedReplayResult::kResourcesNotStable;
+    }
+    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+    SubmitBarriers(true);
+  }
+  if (ps328_guarded_payload && !ps328_ranges_unchanged()) {
+    return NativeGuestTranslatedReplayResult::kResourcesNotStable;
+  }
+  if (ps328_guarded_payload) {
+    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+    SubmitBarriers(true);
+  }
+
+  if (!NativeRhiBeginTranslatedReplayScope(
+          output_context.device, target.color, target.depth_stencil,
+          target.color_format, target.depth_stencil_format, target.width,
+          target.height, target.sample_count, target.clear_color,
+          target.clear_color_value.data(), target.clear_depth_stencil,
+          target.clear_depth_value, target.clear_stencil_value)) {
+    return NativeGuestTranslatedReplayResult::kRenderScopeUnavailable;
+  }
+
+  const VkPipelineLayout pipeline_layout =
+      token_state->pipeline_layout->GetPipelineLayout();
+  BindExternalGraphicsPipeline(token_state->pipeline, true, true, true);
+  for (uint32_t set = 0;
+       set < SpirvShaderTranslator::kDescriptorSetCount; ++set) {
+    if (set == kSetConstants && token_state->constants_push_descriptors) {
+      deferred_command_buffer_.CmdVkPushUniformBufferDescriptorSet(
+          VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, set,
+          SpirvShaderTranslator::kConstantBufferCount,
+          token_state->constant_buffers);
+      continue;
+    }
+    if (!(token.descriptor_set_valid_mask & (uint32_t(1) << set))) {
+      continue;
+    }
+    const VkDescriptorSet descriptor_set = token_state->descriptor_sets[set];
+    if (descriptor_set != VK_NULL_HANDLE) {
+      deferred_command_buffer_.CmdVkBindDescriptorSets(
+          VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, set, 1,
+          &descriptor_set, 0, nullptr);
+    }
+  }
+
+  VkViewport viewport = {
+      token.viewport[0], token.viewport[1], token.viewport[2],
+      token.viewport[3], token.viewport[4], token.viewport[5]};
+  VkRect2D scissor = {
+      {token.scissor_offset[0], token.scissor_offset[1]},
+      {token.scissor_extent[0], token.scissor_extent[1]}};
+  deferred_command_buffer_.CmdVkSetViewport(0, 1, &viewport);
+  deferred_command_buffer_.CmdVkSetScissor(0, 1, &scissor);
+  deferred_command_buffer_.CmdVkSetDepthBias(
+      token.depth_bias_constant_factor, 0.0f,
+      token.depth_bias_slope_factor);
+  deferred_command_buffer_.CmdVkSetBlendConstants(
+      token.blend_constants.data());
+  deferred_command_buffer_.CmdVkSetStencilCompareMask(
+      VK_STENCIL_FACE_FRONT_BIT, token.stencil_compare_mask_front);
+  deferred_command_buffer_.CmdVkSetStencilCompareMask(
+      VK_STENCIL_FACE_BACK_BIT, token.stencil_compare_mask_back);
+  deferred_command_buffer_.CmdVkSetStencilWriteMask(
+      VK_STENCIL_FACE_FRONT_BIT, token.stencil_write_mask_front);
+  deferred_command_buffer_.CmdVkSetStencilWriteMask(
+      VK_STENCIL_FACE_BACK_BIT, token.stencil_write_mask_back);
+  deferred_command_buffer_.CmdVkSetStencilReference(
+      VK_STENCIL_FACE_FRONT_BIT, token.stencil_reference_front);
+  deferred_command_buffer_.CmdVkSetStencilReference(
+      VK_STENCIL_FACE_BACK_BIT, token.stencil_reference_back);
+  if (token.indexed) {
+    deferred_command_buffer_.CmdVkBindIndexBuffer(
+        token_state->index_buffer, token_state->index_buffer_offset,
+        token_state->index_type);
+    deferred_command_buffer_.CmdVkDrawIndexed(
+        token.host_vertex_or_index_count, 1, 0, 0, 0);
+  } else {
+    deferred_command_buffer_.CmdVkDraw(
+        token.host_vertex_or_index_count, 1, 0, 0);
+  }
+  NativeRhiEndTranslatedReplayScope(output_context.device);
+
+  InvalidateGraphicsStateAfterTranslatedReplay();
+  return NativeGuestTranslatedReplayResult::kSucceeded;
+}
+
+NativeGuestTranslatedReplayResult
+VulkanCommandProcessor::ReplayNativeGuestTranslatedDrawBatch(
+    const NativeGuestOutputRenderContext& output_context,
+    const std::vector<NativeGuestTranslatedReplayTokenContext>& tokens,
+    const NativeGuestTranslatedReplayTarget& target) {
+  constexpr uint32_t kSetSharedMemoryAndEdram =
+      SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram;
+  constexpr uint32_t kSetConstants =
+      SpirvShaderTranslator::kDescriptorSetConstants;
+  constexpr uint32_t kRequiredBaseSetMask =
+      (uint32_t(1) << kSetSharedMemoryAndEdram) |
+      (uint32_t(1) << kSetConstants);
+  constexpr uint32_t kAllConstantBufferMask =
+      (uint32_t(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
+
+  if (output_context.backend != NativeGuestOutputBackend::kVulkan ||
+      output_context.device == nullptr ||
+      output_context.device != native_rhi_device_ || !submission_open_ ||
+      output_context.backend_frame_sequence == 0 ||
+      output_context.backend_frame_sequence != frame_current_) {
+    return NativeGuestTranslatedReplayResult::kInvalidContext;
+  }
+  if (tokens.empty() ||
+      tokens.size() > NativeGuestGuardedReplayBatch::kMaximumTokens) {
+    return NativeGuestTranslatedReplayResult::kInvalidToken;
+  }
+  if (target.color == nullptr ||
+      target.color == output_context.guest_output ||
+      target.width == 0 || target.height == 0 ||
+      !std::isfinite(target.clear_depth_value) ||
+      target.clear_depth_value < 0.0f ||
+      target.clear_depth_value > 1.0f ||
+      !std::all_of(target.clear_color_value.begin(),
+                   target.clear_color_value.end(),
+                   [](float value) { return std::isfinite(value); })) {
+    return NativeGuestTranslatedReplayResult::kIncompatibleTarget;
+  }
+
+  // The vector stores backend-private states only after every token has
+  // passed. Nothing below this preflight records a command.
+  std::vector<const TranslatedReplayTokenState*> token_states;
+  token_states.reserve(tokens.size());
+  std::vector<uint64_t> opaque_tokens;
+  opaque_tokens.reserve(tokens.size());
+  for (const NativeGuestTranslatedReplayTokenContext& token : tokens) {
+    if (!token.valid ||
+        token.backend != NativeGuestOutputBackend::kVulkan ||
+        token.opaque_token == 0 ||
+        token.backend_frame_sequence != frame_current_ ||
+        translated_replay_token_frame_ != frame_current_ ||
+        std::ranges::find(opaque_tokens, token.opaque_token) !=
+            opaque_tokens.end()) {
+      return NativeGuestTranslatedReplayResult::kInvalidToken;
+    }
+    opaque_tokens.push_back(token.opaque_token);
+
+    const TranslatedReplayTokenState* token_state = nullptr;
+    for (const TranslatedReplayTokenState& candidate :
+         translated_replay_token_states_) {
+      if (candidate.opaque_token == token.opaque_token &&
+          candidate.frame == token.backend_frame_sequence) {
+        token_state = &candidate;
+        break;
+      }
+    }
+    if (token_state == nullptr ||
+        token_state->public_context.vertex_shader_hash !=
+            token.vertex_shader_hash ||
+        token_state->public_context.pixel_shader_hash !=
+            token.pixel_shader_hash ||
+        token_state->public_context.vertex_shader_modification !=
+            token.vertex_shader_modification ||
+        token_state->public_context.pixel_shader_modification !=
+            token.pixel_shader_modification) {
+      return NativeGuestTranslatedReplayResult::kInvalidToken;
+    }
+    if (token_state->pipeline == VK_NULL_HANDLE ||
+        token_state->pipeline_layout == nullptr ||
+        token_state->pipeline_layout->GetPipelineLayout() ==
+            VK_NULL_HANDLE ||
+        (token.descriptor_set_valid_mask & kRequiredBaseSetMask) !=
+            kRequiredBaseSetMask ||
+        (token.constant_buffer_valid_mask & kAllConstantBufferMask) !=
+            kAllConstantBufferMask ||
+        token_state->descriptor_sets[kSetSharedMemoryAndEdram] ==
+            VK_NULL_HANDLE ||
+        (!token_state->constants_push_descriptors &&
+         token_state->descriptor_sets[kSetConstants] == VK_NULL_HANDLE) ||
+        (token.indexed && token_state->index_buffer == VK_NULL_HANDLE)) {
+      return NativeGuestTranslatedReplayResult::kIncompleteBindings;
+    }
+    if (!token.dynamic_rendering || !token_state->dynamic_rendering ||
+        token.color_attachment_count != 1 ||
+        token.color_attachment_formats[0] == nrhi::Format::kUnknown ||
+        token.sample_count == 0 ||
+        token.host_vertex_or_index_count == 0) {
+      return NativeGuestTranslatedReplayResult::kUnsupportedDraw;
+    }
+
+    const bool token_has_depth =
+        token.depth_attachment_format != nrhi::Format::kUnknown;
+    if (target.color_format != token.color_attachment_formats[0] ||
+        target.sample_count != token.sample_count ||
+        (target.depth_stencil != nullptr) != token_has_depth ||
+        (token_has_depth &&
+         (target.depth_stencil_format != token.depth_attachment_format ||
+          token.stencil_attachment_format !=
+              token.depth_attachment_format))) {
+      return NativeGuestTranslatedReplayResult::kIncompatibleTarget;
+    }
+    if (!token.resources_stable_for_deferred_replay ||
+        !token_state->public_context
+             .resources_stable_for_deferred_replay) {
+      return NativeGuestTranslatedReplayResult::kResourcesNotStable;
+    }
+
+    // Admission is by guarded family, not by a fixed shader-pair list: any
+    // family that passed capture-time budgets and the three-tile proof is
+    // replayable here, and each is held to the texture-count contract it was
+    // admitted under. PS328 keeps its original exact-two-texture rule.
+    const bool is_ps328 =
+        token.vertex_shader_hash == kGuardedPs328VertexShader &&
+        token.pixel_shader_hash == kGuardedPs328PixelShader;
+    const size_t texture_count =
+        token_state->ps328_texture_resources.size();
+    size_t minimum_textures = 2;
+    size_t maximum_textures = 2;
+    bool admitted_family = is_ps328;
+    if (!is_ps328) {
+      const size_t family_index = FindGuardedReplayFamilyIndex(
+          token.vertex_shader_hash, token.pixel_shader_hash);
+      if (family_index != translated_guarded_families_.size()) {
+        const GuardedReplayFamilySpec& spec =
+            translated_guarded_families_[family_index].spec;
+        minimum_textures = spec.minimum_unique_textures;
+        maximum_textures = spec.maximum_unique_textures;
+        admitted_family = true;
+      }
+    }
+    if (!token_state->ps328_resources_guarded || !admitted_family ||
+        texture_count < minimum_textures ||
+        texture_count > maximum_textures ||
+        token_state->ps328_guest_ranges.empty() ||
+        !token.resource_contents_valid ||
+        token.texture_resources !=
+            token_state->public_context.texture_resources ||
+        token.sampler_resources !=
+            token_state->public_context.sampler_resources) {
+      return NativeGuestTranslatedReplayResult::kResourcesNotStable;
+    }
+    for (const TranslatedReplayTokenState::StableGuestRange& range :
+         token_state->ps328_guest_ranges) {
+      if (range.address == 0 || !range.bytes || range.bytes->empty() ||
+          !shared_memory_->RequestRangeIfBytesEqual(
+              range.address, uint32_t(range.bytes->size()),
+              range.bytes->data())) {
+        return NativeGuestTranslatedReplayResult::kResourcesNotStable;
+      }
+    }
+    token_states.push_back(token_state);
+  }
+
+  // All validation, current-frame checks and mutable-byte comparisons have
+  // succeeded. From here the transaction records exactly one render scope.
+  if (!NativeRhiCanBeginTranslatedReplayScope(
+          output_context.device, target.color, target.depth_stencil,
+          target.color_format, target.depth_stencil_format, target.width,
+          target.height, target.sample_count,
+          target.clear_color_value.data())) {
+    return NativeGuestTranslatedReplayResult::kRenderScopeUnavailable;
+  }
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+  if (!NativeRhiBeginTranslatedReplayScope(
+          output_context.device, target.color, target.depth_stencil,
+          target.color_format, target.depth_stencil_format, target.width,
+          target.height, target.sample_count, target.clear_color,
+          target.clear_color_value.data(), target.clear_depth_stencil,
+          target.clear_depth_value, target.clear_stencil_value)) {
+    return NativeGuestTranslatedReplayResult::kRenderScopeUnavailable;
+  }
+
+  for (size_t token_index = 0; token_index < tokens.size();
+       ++token_index) {
+    const NativeGuestTranslatedReplayTokenContext& token =
+        tokens[token_index];
+    const TranslatedReplayTokenState& token_state =
+        *token_states[token_index];
+    const VkPipelineLayout pipeline_layout =
+        token_state.pipeline_layout->GetPipelineLayout();
+    BindExternalGraphicsPipeline(token_state.pipeline, true, true, true);
+    for (uint32_t set = 0;
+         set < SpirvShaderTranslator::kDescriptorSetCount; ++set) {
+      if (set == kSetConstants &&
+          token_state.constants_push_descriptors) {
+        deferred_command_buffer_.CmdVkPushUniformBufferDescriptorSet(
+            VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, set,
+            SpirvShaderTranslator::kConstantBufferCount,
+            token_state.constant_buffers);
+        continue;
+      }
+      if (!(token.descriptor_set_valid_mask & (uint32_t(1) << set))) {
+        continue;
+      }
+      const VkDescriptorSet descriptor_set =
+          token_state.descriptor_sets[set];
+      if (descriptor_set != VK_NULL_HANDLE) {
+        deferred_command_buffer_.CmdVkBindDescriptorSets(
+            VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, set, 1,
+            &descriptor_set, 0, nullptr);
+      }
+    }
+
+    const VkViewport viewport = {
+        token.viewport[0], token.viewport[1], token.viewport[2],
+        token.viewport[3], token.viewport[4], token.viewport[5]};
+    const VkRect2D scissor = {
+        {token.scissor_offset[0], token.scissor_offset[1]},
+        {token.scissor_extent[0], token.scissor_extent[1]}};
+    deferred_command_buffer_.CmdVkSetViewport(0, 1, &viewport);
+    deferred_command_buffer_.CmdVkSetScissor(0, 1, &scissor);
+    deferred_command_buffer_.CmdVkSetDepthBias(
+        token.depth_bias_constant_factor, 0.0f,
+        token.depth_bias_slope_factor);
+    deferred_command_buffer_.CmdVkSetBlendConstants(
+        token.blend_constants.data());
+    deferred_command_buffer_.CmdVkSetStencilCompareMask(
+        VK_STENCIL_FACE_FRONT_BIT, token.stencil_compare_mask_front);
+    deferred_command_buffer_.CmdVkSetStencilCompareMask(
+        VK_STENCIL_FACE_BACK_BIT, token.stencil_compare_mask_back);
+    deferred_command_buffer_.CmdVkSetStencilWriteMask(
+        VK_STENCIL_FACE_FRONT_BIT, token.stencil_write_mask_front);
+    deferred_command_buffer_.CmdVkSetStencilWriteMask(
+        VK_STENCIL_FACE_BACK_BIT, token.stencil_write_mask_back);
+    deferred_command_buffer_.CmdVkSetStencilReference(
+        VK_STENCIL_FACE_FRONT_BIT, token.stencil_reference_front);
+    deferred_command_buffer_.CmdVkSetStencilReference(
+        VK_STENCIL_FACE_BACK_BIT, token.stencil_reference_back);
+    if (token.indexed) {
+      deferred_command_buffer_.CmdVkBindIndexBuffer(
+          token_state.index_buffer, token_state.index_buffer_offset,
+          token_state.index_type);
+      deferred_command_buffer_.CmdVkDrawIndexed(
+          token.host_vertex_or_index_count, 1, 0, 0, 0);
+    } else {
+      deferred_command_buffer_.CmdVkDraw(
+          token.host_vertex_or_index_count, 1, 0, 0);
+    }
+  }
+  NativeRhiEndTranslatedReplayScope(output_context.device);
+
+  // Invalidate once after the single scope, rather than once per logical draw.
+  InvalidateGraphicsStateAfterTranslatedReplay();
+  return NativeGuestTranslatedReplayResult::kSucceeded;
 }
 
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
@@ -4180,6 +6019,36 @@ static void PopulateNativeGuestDrawStateContract(
   context.draw_state_contract_valid = true;
 }
 
+static void PopulateNativeGuestRenderTargetState(
+    NativeGuestDrawContext& context, const RegisterFile& regs) {
+  const reg::RB_COLOR_INFO color_info =
+      regs.Get<reg::RB_COLOR_INFO>();
+  const reg::RB_DEPTH_INFO depth_info =
+      regs.Get<reg::RB_DEPTH_INFO>();
+  const reg::RB_SURFACE_INFO surface_info =
+      regs.Get<reg::RB_SURFACE_INFO>();
+  const reg::RB_MODECONTROL mode_control =
+      regs.Get<reg::RB_MODECONTROL>();
+
+  NativeGuestDrawContext::RenderTargetState& state =
+      context.render_target_state;
+  state.rb_color_info_0 = color_info.value;
+  state.rb_depth_info = depth_info.value;
+  state.rb_surface_info = surface_info.value;
+  state.rb_modecontrol = mode_control.value;
+  state.color_edram_base =
+      color_info.color_base | (color_info.color_base_bit_11 << 11);
+  state.depth_edram_base =
+      depth_info.depth_base | (depth_info.depth_base_bit_11 << 11);
+  state.surface_pitch = surface_info.surface_pitch;
+  state.edram_mode = uint32_t(mode_control.edram_mode);
+  state.valid = true;
+
+  // Keep the legacy convenience field sourced from the same authoritative
+  // register decode.
+  context.surface_pitch = state.surface_pitch;
+}
+
 static void PopulateNativeGuestVertexFetchIdentity(
     NativeGuestDrawContext& context, const RegisterFile& regs) {
   const auto capture = [&](uint32_t slot) {
@@ -4246,6 +6115,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       fingerprint.vertex_count = index_count;
       fingerprint.primitive_count = primitive_count;
       PROFILE_DRAW_FINGERPRINT(fingerprint);
+    }
+    // Draw and resolve suppression must agree, so the MAIN timing probe drops
+    // the resolves of the passes whose draws it dropped.
+    if (ShouldSuppressMainPassForBenchmark(
+            regs.Get<reg::RB_SURFACE_INFO>().surface_pitch)) {
+      return true;
     }
     if (ShouldSuppressEmulatedDraws() &&
         ShouldSuppressPassAtPitch(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch)) {
@@ -4433,6 +6308,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // uncomposed (garbage), the light/dark checkerboard ground. CAS outfit
   // composition mid-gameplay is covered by the same rule. (Mirrors the
   // D3D12 gate; agreement with the resolve gate above is an invariant.)
+  // The MAIN-pass timing probe runs without a serving native renderer, so it
+  // is checked separately from the serving suppression gate below.
+  if (!memexport_writes_possible &&
+      ShouldSuppressMainPassForBenchmark(
+          regs.Get<reg::RB_SURFACE_INFO>().surface_pitch)) {
+    return true;
+  }
   if (!memexport_writes_possible && ShouldSuppressEmulatedDraws()) {
     const uint32_t suppress_pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
     if (ShouldSuppressPassAtPitch(suppress_pitch)) {
@@ -4607,12 +6489,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           primitive_processing_result.index_buffer_type !=
               PrimitiveProcessor::ProcessedIndexBufferType::
                   kHostBuiltinForAuto;
-      native_draw_context.surface_pitch =
-          regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
       native_draw_context.indexed = true;
       PopulateNativeGuestDrawStateContract(
           native_draw_context, regs, normalized_depth_control,
           normalized_color_mask, primitive_processing_result);
+      PopulateNativeGuestRenderTargetState(native_draw_context, regs);
       PopulateNativeGuestVertexFetchIdentity(native_draw_context, regs);
 
       if (MatchesNativeGuestDraw(native_draw_context)) {
@@ -4740,6 +6621,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                                                   pixel_shader_translation)) {
       return draw_fail("shader_translation");
     }
+    ObserveGuestShaderArtifactIfRequested(vertex_shader_translation);
+    ObserveGuestShaderArtifactIfRequested(pixel_shader_translation);
     translate_stage_timer.Stop();
     rex::perf::ScopedCounterTimer samplers_stage_timer(
         rex::perf::CounterId::kDrawStageSamplersUs);
@@ -5089,6 +6972,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   {
     rex::perf::ScopedCounterTimer stage_timer(rex::perf::CounterId::kDrawStageVertexBuffersUs);
     const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
+    constexpr uint64_t kTranslatedRectangleVertexShader =
+        UINT64_C(0x0A6D1DD7767FDF27);
+    constexpr uint32_t kTranslatedRectangleBytes = 84;
+    const bool translated_rectangle_draw =
+        vertex_shader->ucode_data_hash() ==
+        kTranslatedRectangleVertexShader;
+    if (translated_rectangle_draw) {
+      translated_rectangle_fetch_seen_ = false;
+      translated_rectangle_candidate_fetch_count_ = 0;
+      translated_rectangle_snapshot_valid_ = false;
+      translated_rectangle_snapshot_frame_ = frame_current_;
+    }
     for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
       uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
       uint32_t j;
@@ -5096,10 +6991,58 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         vfetch_bits_remaining &= ~(uint32_t(1) << j);
         uint32_t vfetch_index = i * 32 + j;
         uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
+        xenos::xe_gpu_vertex_fetch_t vfetch_constant =
+            regs.GetVertexFetch(vfetch_index);
+        if (translated_rectangle_draw) {
+          translated_rectangle_fetch_seen_ = true;
+          translated_rectangle_fetch_index_ = vfetch_index;
+          translated_rectangle_fetch_type_ =
+              uint32_t(vfetch_constant.type);
+          translated_rectangle_fetch_size_bytes_ =
+              vfetch_constant.size << 2;
+          translated_rectangle_fetch_address_ =
+              vfetch_constant.address << 2;
+          translated_rectangle_fetch_translate_valid_ =
+              shared_memory_->DebugTranslatePhysical(
+                  translated_rectangle_fetch_address_) != nullptr;
+        }
+        if (translated_rectangle_draw &&
+            uint32_t(vfetch_constant.size << 2) >=
+                kTranslatedRectangleBytes &&
+            vfetch_constant.type == xenos::FetchConstantType::kVertex) {
+          ++translated_rectangle_candidate_fetch_count_;
+          const uint32_t rectangle_address =
+              vfetch_constant.address << 2;
+          const uint8_t* rectangle_bytes =
+              shared_memory_->DebugTranslatePhysical(rectangle_address);
+          translated_rectangle_snapshot_valid_ =
+              translated_rectangle_candidate_fetch_count_ == 1 &&
+              rectangle_bytes != nullptr;
+          if (translated_rectangle_snapshot_valid_) {
+            std::memcpy(translated_rectangle_snapshot_bytes_.data(),
+                        rectangle_bytes, kTranslatedRectangleBytes);
+            translated_rectangle_snapshot_frame_ = frame_current_;
+            translated_rectangle_snapshot_address_ = rectangle_address;
+          }
+          bool expected_inactive = false;
+          if (translated_rectangle_guard_active_.compare_exchange_strong(
+                  expected_inactive, true, std::memory_order_acq_rel)) {
+            if (shared_memory_->WatchMemoryRange(
+                    rectangle_address,
+                    kTranslatedRectangleBytes,
+                    TranslatedRectangleWatchCallback, this, nullptr,
+                    translated_rectangle_guard_generation_.load(
+                        std::memory_order_acquire)) == nullptr) {
+              translated_rectangle_guard_active_.store(
+                  false, std::memory_order_release);
+            } else {
+              translated_rectangle_guard_address_ = rectangle_address;
+            }
+          }
+        }
         if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
           continue;
         }
-        xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
         switch (vfetch_constant.type) {
           case xenos::FetchConstantType::kVertex:
             break;
@@ -5277,6 +7220,1490 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   }
   pre_draw_stage_timer.Stop();
 
+  // Resolve the exact host index binding before observation as well as draw
+  // submission. This is backend-owned state retained by an opaque replay token
+  // when requested; title code never receives the VkBuffer.
+  std::pair<VkBuffer, VkDeviceSize> resolved_index_buffer = {
+      VK_NULL_HANDLE, 0};
+  const bool host_draw_indexed =
+      primitive_processing_result.index_buffer_type !=
+          PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+      !shader_32bit_index_dma;
+  if (host_draw_indexed) {
+    switch (primitive_processing_result.index_buffer_type) {
+      case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA:
+        if (guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE) {
+          resolved_index_buffer.first =
+              guest_dma_index_scratch_buffer.buffer();
+        } else {
+          resolved_index_buffer.first = shared_memory_->buffer();
+          resolved_index_buffer.second =
+              primitive_processing_result.guest_index_base;
+        }
+        break;
+      case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
+        resolved_index_buffer = primitive_processor_->GetConvertedIndexBuffer(
+            primitive_processing_result.host_index_buffer_handle);
+        break;
+      case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto:
+      case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA:
+        resolved_index_buffer = primitive_processor_->GetBuiltinIndexBuffer(
+            primitive_processing_result.host_index_buffer_handle);
+        break;
+      default:
+        return draw_fail("unexpected_index_buffer_type");
+    }
+    if (resolved_index_buffer.first == VK_NULL_HANDLE) {
+      return draw_fail("missing_resolved_index_buffer");
+    }
+  }
+
+  const uint64_t replay_vertex_shader_hash =
+      vertex_shader->ucode_data_hash();
+  const uint64_t replay_pixel_shader_hash =
+      pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0;
+  if (!memexport_writes_possible &&
+      !Shader::IsHostVertexShaderTypeDomain(
+          primitive_processing_result.host_vertex_shader_type) &&
+      HasNativeGuestTranslatedReplayTokenObserver() &&
+      (ShouldCaptureNativeGuestTranslatedReplayToken(
+           replay_vertex_shader_hash, replay_pixel_shader_hash) ||
+       IsBuiltInGuardedReplayFamily(replay_vertex_shader_hash,
+                                    replay_pixel_shader_hash) ||
+       // Generic capture admits every remaining shader pair on the host
+       // render-target path. Pairs that never pass the three-tile proof are
+       // abandoned after a bounded number of frames, so non-MAIN work costs a
+       // brief observation window rather than a permanent per-draw tax.
+       translated_generic_main_guard_enabled_) &&
+      render_target_cache_->GetPath() ==
+          RenderTargetCache::Path::kHostRenderTargets &&
+      current_guest_graphics_pipeline_ != VK_NULL_HANDLE &&
+      current_guest_graphics_pipeline_layout_ != nullptr) {
+    if (translated_replay_token_frame_ != frame_current_) {
+      // Must precede the token-state clear: promotion compares the frame that
+      // is ending against the retained resources.
+      UpdateGuardedReplayFamilyPromotions();
+      translated_replay_token_states_.clear();
+      translated_replay_pipeline_generations_.clear();
+      translated_replay_pipeline_layout_generations_.clear();
+      translated_replay_descriptor_generations_.clear();
+      translated_replay_buffer_generations_.clear();
+      translated_replay_image_view_generations_.clear();
+      translated_replay_object_generation_next_ = 1;
+      translated_ps328_candidate_phase_ =
+          GuardedReplayCandidatePhase::kCollectingFirstBlock;
+      translated_ps328_first_block_contracts_.clear();
+      translated_ps328_normalization_evidence_.clear();
+      translated_ps328_repeat_offset_ = 0;
+      translated_ps328_guarded_bytes_ = 0;
+      translated_ps328_guarded_candidate_count_ = 0;
+      translated_ps328_repeated_token_count_ = 0;
+      translated_ps328_content_generation_canonicalized_tokens_ = 0;
+      translated_ps328_content_generation_canonicalized_bindings_ = 0;
+      translated_ps328_content_generation_reject_count_ = 0;
+      // These are process-lifetime milestone latches, not frame state.
+      // Resetting them here produced one expensive success line per gameplay
+      // frame after the family had already been proven.
+      ResetGuardedReplayFamiliesForNewFrame();
+      translated_ps328_candidate_summary_logged_ = false;
+      translated_replay_token_frame_ = frame_current_;
+    }
+
+    auto get_object_generation =
+        [&](auto& generations, const auto object) -> uint64_t {
+      if (object == decltype(object){}) {
+        return 0;
+      }
+      const auto existing = generations.find(object);
+      if (existing != generations.end()) {
+        return existing->second;
+      }
+      const uint64_t generation =
+          translated_replay_object_generation_next_++;
+      generations.emplace(object, generation);
+      return generation;
+    };
+
+    NativeGuestTranslatedReplayTokenContext token_context;
+    token_context.backend = NativeGuestOutputBackend::kVulkan;
+    token_context.backend_frame_sequence = frame_current_;
+    token_context.opaque_token = translated_replay_token_next_++;
+    token_context.pipeline_generation = get_object_generation(
+        translated_replay_pipeline_generations_,
+        current_guest_graphics_pipeline_);
+    token_context.pipeline_layout_generation = get_object_generation(
+        translated_replay_pipeline_layout_generations_,
+        current_guest_graphics_pipeline_layout_);
+    token_context.vertex_shader_hash = replay_vertex_shader_hash;
+    token_context.pixel_shader_hash = replay_pixel_shader_hash;
+    token_context.vertex_shader_modification =
+        vertex_shader_translation->modification();
+    token_context.pixel_shader_modification =
+        pixel_shader_translation != nullptr
+            ? pixel_shader_translation->modification()
+            : 0;
+
+    TranslatedReplayTokenState token_state;
+    token_state.opaque_token = token_context.opaque_token;
+    token_state.frame = frame_current_;
+    token_state.pipeline = current_guest_graphics_pipeline_;
+    token_state.pipeline_layout = current_guest_graphics_pipeline_layout_;
+
+    for (uint32_t set = 0;
+         set < SpirvShaderTranslator::kDescriptorSetCount; ++set) {
+      const uint32_t set_bit = uint32_t(1) << set;
+      if (!(current_graphics_descriptor_set_values_up_to_date_ & set_bit) ||
+          current_graphics_descriptor_sets_[set] == VK_NULL_HANDLE) {
+        continue;
+      }
+      token_state.descriptor_sets[set] =
+          current_graphics_descriptor_sets_[set];
+      token_context.descriptor_sets[set].generation =
+          get_object_generation(translated_replay_descriptor_generations_,
+                                current_graphics_descriptor_sets_[set]);
+      token_context.descriptor_sets[set].valid = true;
+      token_context.descriptor_set_valid_mask |= set_bit;
+    }
+    constexpr uint32_t kConstantsDescriptorSet =
+        SpirvShaderTranslator::kDescriptorSetConstants;
+    constexpr uint32_t kConstantsDescriptorSetBit =
+        uint32_t(1) << kConstantsDescriptorSet;
+    if (constants_push_descriptors_used_ &&
+        (current_graphics_descriptor_set_values_up_to_date_ &
+         kConstantsDescriptorSetBit)) {
+      token_state.constants_push_descriptors = true;
+      // Push descriptors have no VkDescriptorSet object. Their generation is
+      // the token itself because the exact five buffer ranges below are the
+      // backend-owned descriptor snapshot.
+      token_context.descriptor_sets[kConstantsDescriptorSet].generation =
+          token_context.opaque_token;
+      token_context.descriptor_sets[kConstantsDescriptorSet].valid = true;
+      token_context.descriptor_set_valid_mask |= kConstantsDescriptorSetBit;
+    }
+    for (uint32_t binding = 0;
+         binding < SpirvShaderTranslator::kConstantBufferCount; ++binding) {
+      const uint32_t binding_bit = uint32_t(1) << binding;
+      const VkDescriptorBufferInfo& buffer_info =
+          current_constant_buffer_infos_[binding];
+      if (!(current_constant_buffers_up_to_date_ & binding_bit) ||
+          buffer_info.buffer == VK_NULL_HANDLE || buffer_info.range == 0) {
+        continue;
+      }
+      token_state.constant_buffers[binding] = buffer_info;
+      auto& public_range = token_context.constant_buffers[binding];
+      public_range.resource_generation = get_object_generation(
+          translated_replay_buffer_generations_, buffer_info.buffer);
+      public_range.offset = uint64_t(buffer_info.offset);
+      public_range.range = uint64_t(buffer_info.range);
+      public_range.valid = true;
+      token_context.constant_buffer_valid_mask |= binding_bit;
+    }
+
+    // Copy the values consumed by this exact translated draw. Descriptor
+    // handles and ring-buffer offsets alone cannot prove tiled invariance.
+    token_context.system_constants.resize(sizeof(system_constants_));
+    std::memcpy(token_context.system_constants.data(), &system_constants_,
+                sizeof(system_constants_));
+    token_context.system_constants_mechanical_mask.assign(
+        sizeof(system_constants_), uint8_t(0));
+    token_context.system_constants_ndc_scale_byte_offset =
+        uint32_t(offsetof(SpirvShaderTranslator::SystemConstants, ndc_scale));
+    token_context.system_constants_ndc_offset_byte_offset =
+        uint32_t(offsetof(SpirvShaderTranslator::SystemConstants, ndc_offset));
+    const auto mark_mechanical_system_bytes =
+        [&](size_t offset, size_t size) {
+          std::fill_n(
+              token_context.system_constants_mechanical_mask.begin() + offset,
+              size, uint8_t(1));
+        };
+    mark_mechanical_system_bytes(
+        offsetof(SpirvShaderTranslator::SystemConstants, ndc_scale),
+        sizeof(system_constants_.ndc_scale));
+    mark_mechanical_system_bytes(
+        offsetof(SpirvShaderTranslator::SystemConstants, ndc_offset),
+        sizeof(system_constants_.ndc_offset));
+    mark_mechanical_system_bytes(
+        offsetof(SpirvShaderTranslator::SystemConstants,
+                 edram_32bpp_tile_pitch_dwords_scaled),
+        sizeof(system_constants_.edram_32bpp_tile_pitch_dwords_scaled));
+    mark_mechanical_system_bytes(
+        offsetof(SpirvShaderTranslator::SystemConstants,
+                 edram_depth_base_dwords_scaled),
+        sizeof(system_constants_.edram_depth_base_dwords_scaled));
+    mark_mechanical_system_bytes(
+        offsetof(SpirvShaderTranslator::SystemConstants,
+                 edram_rt_base_dwords_scaled),
+        sizeof(system_constants_.edram_rt_base_dwords_scaled));
+    std::copy(std::begin(system_constants_.ndc_scale),
+              std::end(system_constants_.ndc_scale),
+              token_context.ndc_scale.begin());
+    std::copy(std::begin(system_constants_.ndc_offset),
+              std::end(system_constants_.ndc_offset),
+              token_context.ndc_offset.begin());
+    std::copy(std::begin(current_float_constant_map_vertex_),
+              std::end(current_float_constant_map_vertex_),
+              token_context.vertex_float_constant_usage.begin());
+    std::copy(std::begin(current_float_constant_map_pixel_),
+              std::end(current_float_constant_map_pixel_),
+              token_context.pixel_float_constant_usage.begin());
+    const auto copy_used_float_constants =
+        [&](const uint64_t *usage, uint32_t register_base,
+            std::vector<uint32_t> &destination) {
+          destination.clear();
+          for (uint32_t block = 0; block < 4; ++block) {
+            uint64_t bits = usage[block];
+            uint32_t bit = 0;
+            while (rex::bit_scan_forward(bits, &bit)) {
+              bits &= ~(uint64_t(1) << bit);
+              const uint32_t register_index =
+                  register_base + (block << 8) + (bit << 2);
+              destination.insert(destination.end(), &regs[register_index],
+                                 &regs[register_index] + 4);
+            }
+          }
+        };
+    copy_used_float_constants(
+        current_float_constant_map_vertex_,
+        XE_GPU_REG_SHADER_CONSTANT_000_X,
+        token_context.vertex_float_constants);
+    copy_used_float_constants(
+        current_float_constant_map_pixel_,
+        XE_GPU_REG_SHADER_CONSTANT_256_X,
+        token_context.pixel_float_constants);
+    std::memcpy(token_context.bool_loop_constants.data(),
+                &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+                sizeof(token_context.bool_loop_constants));
+    std::memcpy(token_context.fetch_constants.data(),
+                &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                sizeof(token_context.fetch_constants));
+    token_context.constant_contents_valid =
+        !token_context.system_constants.empty() &&
+        token_context.system_constants.size() ==
+            token_context.system_constants_mechanical_mask.size();
+
+    bool resource_contents_valid = true;
+    const auto capture_texture_resources =
+        [&](const std::vector<VulkanShader::TextureBinding> &bindings,
+            bool is_vertex_shader) {
+          for (size_t binding_index = 0;
+               binding_index < bindings.size(); ++binding_index) {
+            const VulkanShader::TextureBinding &binding =
+                bindings[binding_index];
+            NativeGuestTranslatedReplayTokenContext::TextureResourceBinding
+                resource;
+            resource.descriptor_binding = uint32_t(binding_index);
+            resource.fetch_constant = binding.fetch_constant;
+            resource.dimension = uint32_t(binding.dimension);
+            resource.is_vertex_shader = is_vertex_shader;
+            resource.is_signed = bool(binding.is_signed);
+            if (binding.fetch_constant >= 32) {
+              resource_contents_valid = false;
+              continue;
+            }
+            std::memcpy(
+                resource.fetch_words.data(),
+                &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                      binding.fetch_constant * 6],
+                sizeof(resource.fetch_words));
+
+            TextureCache::DebugActiveTextureBinding active;
+            const bool active_valid =
+                texture_cache_->DebugGetActiveTextureBinding(
+                    binding.fetch_constant, active, resource.is_signed);
+            if (active_valid) {
+              resource.texture_key_hash = active.key_hash;
+              resource.base_address = active.base_address;
+              resource.base_length = active.base_length;
+              resource.mip_address = active.mip_address;
+              resource.mip_length = active.mip_length;
+              resource.width = active.width;
+              resource.height = active.height;
+              resource.depth_or_array_size = active.depth_or_array_size;
+              resource.format = active.format;
+              resource.scaled_resolve = active.scaled_resolve;
+              resource.content_generation = active.content_generation;
+              resource.resident = active.outdated_mask == 0;
+            }
+            const VkImageView image_view =
+                texture_cache_->GetActiveBindingOrNullImageView(
+                    binding.fetch_constant, binding.dimension,
+                    resource.is_signed);
+            resource.image_view_generation = get_object_generation(
+                translated_replay_image_view_generations_, image_view);
+            resource_contents_valid &=
+                active_valid && resource.texture_key_hash != 0 &&
+                resource.image_view_generation != 0 &&
+                resource.content_generation != 0 && resource.resident;
+            token_context.texture_resources.push_back(resource);
+          }
+        };
+    capture_texture_resources(
+        vertex_shader->GetTextureBindingsAfterTranslation(), true);
+    if (pixel_shader != nullptr) {
+      capture_texture_resources(
+          pixel_shader->GetTextureBindingsAfterTranslation(), false);
+    }
+    const auto capture_sampler_resources =
+        [&](const std::vector<VulkanShader::SamplerBinding> &bindings,
+            uint32_t texture_binding_count, bool is_vertex_shader) {
+          for (size_t binding_index = 0;
+               binding_index < bindings.size(); ++binding_index) {
+            const VulkanShader::SamplerBinding &binding =
+                bindings[binding_index];
+            const VulkanTextureCache::SamplerParameters parameters =
+                texture_cache_->GetSamplerParameters(binding);
+            token_context.sampler_resources.push_back({
+                .descriptor_binding =
+                    texture_binding_count + uint32_t(binding_index),
+                .fetch_constant = binding.fetch_constant,
+                .parameters = parameters.value,
+                .is_vertex_shader = is_vertex_shader,
+            });
+          }
+        };
+    capture_sampler_resources(
+        vertex_shader->GetSamplerBindingsAfterTranslation(),
+        uint32_t(vertex_shader->GetTextureBindingsAfterTranslation().size()),
+        true);
+    if (pixel_shader != nullptr) {
+      capture_sampler_resources(
+          pixel_shader->GetSamplerBindingsAfterTranslation(),
+          uint32_t(pixel_shader->GetTextureBindingsAfterTranslation().size()),
+          false);
+    }
+    token_context.resource_contents_valid = resource_contents_valid;
+
+    // Provisionally guard the first contiguous logical block. Its end
+    // isn't guessed: the first repeated exact logical contract starts block
+    // two, and two complete repetitions prove the three-tile callback shape.
+    // Repeated tiles are evidence only and never retain private snapshots.
+    // Storage bytes shared by multiple logical draws are reference-deduped
+    // across the frame under one aggregate budget.
+    const bool is_ps328_token =
+        replay_vertex_shader_hash == kGuardedPs328VertexShader &&
+        replay_pixel_shader_hash == kGuardedPs328PixelShader;
+    constexpr GuardedReplayFamilySpec kPs328FamilySpec{
+        .family = NativeGuestGuardedReplayFamily::kVenuePs328,
+        .vertex_shader_hashes = {kGuardedPs328VertexShader, 0},
+        .vertex_shader_count = 1,
+        .pixel_shader_hash = kGuardedPs328PixelShader,
+        .maximum_first_block_tokens = 256,
+        .maximum_guarded_bytes = 32 * 1024 * 1024,
+        .maximum_ranges_per_token = 64,
+        .maximum_frame_ranges = 4096,
+        .minimum_unique_textures = 2,
+        .maximum_unique_textures = 2,
+    };
+    GuardedReplayFamilyFrameState unused_family_state;
+    GuardedReplayFamilyFrameState *non_ps_family_state =
+        &unused_family_state;
+    const GuardedReplayFamilySpec *guarded_family_spec = nullptr;
+    if (is_ps328_token) {
+      guarded_family_spec = &kPs328FamilySpec;
+    } else {
+      const size_t family_index = FindOrCreateGuardedReplayFamilyIndex(
+          replay_vertex_shader_hash, replay_pixel_shader_hash);
+      // An abandoned family is left unguarded: it still produces a public
+      // token, but no payload is copied for it.
+      if (family_index < translated_guarded_families_.size() &&
+          !translated_guarded_families_[family_index].state.abandoned) {
+        non_ps_family_state =
+            &translated_guarded_families_[family_index].state;
+        guarded_family_spec =
+            &translated_guarded_families_[family_index].spec;
+      }
+    }
+    const bool is_guarded_family_token = guarded_family_spec != nullptr;
+    GuardedReplayCandidatePhase &guarded_family_phase =
+        is_ps328_token ? translated_ps328_candidate_phase_
+                       : non_ps_family_state->phase;
+    auto &guarded_family_contracts =
+        is_ps328_token
+            ? translated_ps328_first_block_contracts_
+            : non_ps_family_state->first_block_contracts;
+    auto &guarded_family_normalization_evidence =
+        is_ps328_token
+            ? translated_ps328_normalization_evidence_
+            : non_ps_family_state->normalization_evidence;
+    // Discovered families draw from one frame-wide allowance so that admitting
+    // more of the MAIN pass cannot multiply the capture cost by family count.
+    const bool shares_generic_bytes =
+        !is_ps328_token && guarded_family_spec != nullptr &&
+        guarded_family_spec->shares_generic_byte_budget;
+    size_t &guarded_family_bytes =
+        is_ps328_token          ? translated_ps328_guarded_bytes_
+        : shares_generic_bytes  ? translated_generic_guarded_bytes_
+                                : non_ps_family_state->guarded_bytes;
+    // PS328 predates the explicit range-count budget. Keep its behavior
+    // byte-for-byte compatible; only newer family specs consume this counter.
+    size_t legacy_ps328_range_count = 0;
+    size_t &guarded_family_range_count =
+        is_ps328_token ? legacy_ps328_range_count
+                       : non_ps_family_state->retained_range_count;
+    const bool ps328_candidate_capture =
+        is_guarded_family_token &&
+        guarded_family_phase ==
+            GuardedReplayCandidatePhase::kCollectingFirstBlock &&
+        guarded_family_contracts.size() <
+            guarded_family_spec->maximum_first_block_tokens;
+    enum Ps328GuardFailure : uint32_t {
+      kPs328GuardNotCandidate = 1u << 0,
+      kPs328GuardInvalidVertexFetch = 1u << 1,
+      kPs328GuardInvalidRange = 1u << 2,
+      kPs328GuardBudgetExceeded = 1u << 3,
+      kPs328GuardTranslateFailed = 1u << 4,
+      kPs328GuardUnsupportedIndexOwner = 1u << 5,
+      kPs328GuardUnsupportedIndexFormat = 1u << 6,
+      kPs328GuardTextureCount = 1u << 7,
+      kPs328GuardTextureEvidence = 1u << 8,
+      kPs328GuardTextureNotResident = 1u << 9,
+      kPs328GuardScaledTexture = 1u << 10,
+      kPs328GuardTextureRange = 1u << 11,
+      kPs328GuardConstants = 1u << 12,
+      kPs328GuardNoRanges = 1u << 13,
+    };
+    uint32_t ps328_guard_failure_mask =
+        is_guarded_family_token && !ps328_candidate_capture
+            ? kPs328GuardNotCandidate
+            : 0;
+    size_t ps328_guarded_bytes = 0;
+    size_t ps328_new_guarded_bytes = 0;
+    bool ps328_guard_capture_valid = ps328_candidate_capture;
+    uint32_t ps328_vertex_fetch_count = 0;
+    uint32_t ps328_vertex_fetch_type = 0;
+    uint32_t ps328_vertex_fetch_address = 0;
+    uint32_t ps328_vertex_fetch_length = 0;
+    std::vector<
+        NativeGuestTranslatedReplayTokenContext::TextureResourceBinding>
+        ps328_unique_textures;
+    const auto same_ps328_texture_payload =
+        [](const NativeGuestTranslatedReplayTokenContext::
+               TextureResourceBinding &left,
+           const NativeGuestTranslatedReplayTokenContext::
+               TextureResourceBinding &right) {
+          // This identity only deduplicates mutable guest storage for the
+          // snapshot. Fetch/binding interpretation, descriptor binding,
+          // shader stage, and image-view generation remain exact in the full
+          // public binding evidence and replay invariance checks.
+          return left.texture_key_hash == right.texture_key_hash &&
+                 left.base_address == right.base_address &&
+                 left.base_length == right.base_length &&
+                 left.mip_address == right.mip_address &&
+                 left.mip_length == right.mip_length &&
+                 left.width == right.width &&
+                 left.height == right.height &&
+                 left.depth_or_array_size ==
+                     right.depth_or_array_size &&
+                 left.format == right.format &&
+                 left.scaled_resolve == right.scaled_resolve &&
+                 left.content_generation == right.content_generation &&
+                 left.resident == right.resident;
+        };
+    const auto capture_ps328_guest_range =
+        [&](uint32_t address, uint32_t length) {
+          if (!ps328_guard_capture_valid) {
+            return;
+          }
+          if (address == 0 || length == 0) {
+            ps328_guard_failure_mask |= kPs328GuardInvalidRange;
+            ps328_guard_capture_valid = false;
+            return;
+          }
+          if (guarded_family_bytes >
+                  guarded_family_spec->maximum_guarded_bytes ||
+              ps328_new_guarded_bytes >
+                  guarded_family_spec->maximum_guarded_bytes -
+                      guarded_family_bytes ||
+              length >
+                  guarded_family_spec->maximum_guarded_bytes -
+                      guarded_family_bytes - ps328_new_guarded_bytes) {
+            ps328_guard_failure_mask |= kPs328GuardBudgetExceeded;
+            ps328_guard_capture_valid = false;
+            return;
+          }
+          if (!is_ps328_token && is_guarded_family_token &&
+              token_state.ps328_guest_ranges.size() >=
+                  guarded_family_spec->maximum_ranges_per_token) {
+            ps328_guard_failure_mask |= kPs328GuardBudgetExceeded;
+            ps328_guard_capture_valid = false;
+            return;
+          }
+          for (const auto &existing_token :
+               translated_replay_token_states_) {
+            const auto existing = std::ranges::find_if(
+                existing_token.ps328_guest_ranges,
+                [&](const TranslatedReplayTokenState::StableGuestRange
+                        &range) {
+                  return range.address == address && range.bytes &&
+                         range.bytes->size() == length &&
+                         shared_memory_->GuestBytesEqual(
+                             address, length, range.bytes->data());
+                });
+            if (existing != existing_token.ps328_guest_ranges.end()) {
+              token_state.ps328_guest_ranges.push_back(*existing);
+              ps328_guarded_bytes += length;
+              return;
+            }
+          }
+          auto bytes = std::make_shared<std::vector<uint8_t>>();
+          if (!shared_memory_->CopyGuestBytes(address, length, *bytes)) {
+            ps328_guard_failure_mask |= kPs328GuardTranslateFailed;
+            ps328_guard_capture_valid = false;
+            return;
+          }
+          auto &range = token_state.ps328_guest_ranges.emplace_back();
+          range.address = address;
+          range.bytes = std::move(bytes);
+          ps328_guarded_bytes += length;
+          ps328_new_guarded_bytes += length;
+        };
+    if (is_guarded_family_token) {
+      const Shader::ConstantRegisterMap &vertex_map =
+          vertex_shader->constant_register_map();
+      for (uint32_t block = 0;
+           block < rex::countof(vertex_map.vertex_fetch_bitmap); ++block) {
+        uint32_t fetches = vertex_map.vertex_fetch_bitmap[block];
+        uint32_t bit = 0;
+        while (rex::bit_scan_forward(fetches, &bit)) {
+          fetches &= ~(uint32_t(1) << bit);
+          const xenos::xe_gpu_vertex_fetch_t fetch =
+              regs.GetVertexFetch(block * 32 + bit);
+          ++ps328_vertex_fetch_count;
+          ps328_vertex_fetch_type = uint32_t(fetch.type);
+          ps328_vertex_fetch_address = fetch.address << 2;
+          ps328_vertex_fetch_length = fetch.size << 2;
+          if (fetch.type != xenos::FetchConstantType::kVertex) {
+            ps328_guard_failure_mask |= kPs328GuardInvalidVertexFetch;
+            ps328_guard_capture_valid = false;
+            continue;
+          }
+          capture_ps328_guest_range(fetch.address << 2, fetch.size << 2);
+        }
+      }
+      // PS328 is a 16-bit indexed triangle-list path. A host-converted buffer
+      // is owned by VulkanPrimitiveProcessor's frame pool and is immutable for
+      // the token frame; its original guest range is still byte-guarded here.
+      const bool stable_index_owner =
+          primitive_processing_result.index_buffer_type ==
+              PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+          primitive_processing_result.index_buffer_type ==
+              PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted;
+      if (!stable_index_owner ||
+          primitive_processing_result.host_index_format !=
+              xenos::IndexFormat::kInt16) {
+        if (!stable_index_owner) {
+          ps328_guard_failure_mask |=
+              kPs328GuardUnsupportedIndexOwner;
+        }
+        if (primitive_processing_result.host_index_format !=
+            xenos::IndexFormat::kInt16) {
+          ps328_guard_failure_mask |=
+              kPs328GuardUnsupportedIndexFormat;
+        }
+        ps328_guard_capture_valid = false;
+      } else {
+        capture_ps328_guest_range(
+            primitive_processing_result.guest_index_base,
+            primitive_processing_result.guest_draw_vertex_count *
+                uint32_t(sizeof(uint16_t)));
+      }
+      for (const auto &texture : token_context.texture_resources) {
+        if (!texture.resident) {
+          ps328_guard_failure_mask |= kPs328GuardTextureNotResident;
+          ps328_guard_capture_valid = false;
+        }
+        if (texture.scaled_resolve) {
+          ps328_guard_failure_mask |= kPs328GuardScaledTexture;
+          ps328_guard_capture_valid = false;
+        }
+        if (texture.base_address == 0 || texture.base_length == 0) {
+          ps328_guard_failure_mask |= kPs328GuardTextureRange;
+          ps328_guard_capture_valid = false;
+        }
+        const auto existing = std::ranges::find_if(
+            ps328_unique_textures,
+            [&](const auto &candidate) {
+              return same_ps328_texture_payload(candidate, texture);
+            });
+        if (existing == ps328_unique_textures.end()) {
+          ps328_unique_textures.push_back(texture);
+        }
+      }
+      if (ps328_unique_textures.size() <
+              guarded_family_spec->minimum_unique_textures ||
+          ps328_unique_textures.size() >
+              guarded_family_spec->maximum_unique_textures) {
+        ps328_guard_failure_mask |= kPs328GuardTextureCount;
+        ps328_guard_capture_valid = false;
+      }
+      if (!token_context.resource_contents_valid) {
+        ps328_guard_failure_mask |= kPs328GuardTextureEvidence;
+        ps328_guard_capture_valid = false;
+      }
+      if (ps328_guard_capture_valid) {
+        token_state.ps328_texture_resources = ps328_unique_textures;
+        for (const auto &texture : ps328_unique_textures) {
+          capture_ps328_guest_range(texture.base_address,
+                                    texture.base_length);
+          if (texture.mip_length != 0) {
+            capture_ps328_guest_range(texture.mip_address,
+                                      texture.mip_length);
+          }
+        }
+      }
+      token_state.ps328_resources_guarded =
+          ps328_guard_capture_valid &&
+          !token_state.ps328_guest_ranges.empty() &&
+          token_context.constant_contents_valid;
+      if (!is_ps328_token && is_guarded_family_token &&
+          token_state.ps328_guest_ranges.size() >
+              guarded_family_spec->maximum_frame_ranges -
+                  std::min(guarded_family_range_count,
+                           guarded_family_spec->maximum_frame_ranges)) {
+        ps328_guard_failure_mask |= kPs328GuardBudgetExceeded;
+        token_state.ps328_resources_guarded = false;
+      }
+      if (token_state.ps328_guest_ranges.empty()) {
+        ps328_guard_failure_mask |= kPs328GuardNoRanges;
+      }
+      if (!token_context.constant_contents_valid) {
+        ps328_guard_failure_mask |= kPs328GuardConstants;
+      }
+      if (ps328_candidate_capture &&
+          !token_state.ps328_resources_guarded &&
+          !translated_ps328_guard_diagnostic_logged_) {
+        translated_ps328_guard_diagnostic_logged_ = true;
+        REXLOG_INFO(
+            "Translated PS328 guard rejected: reasons={:08X} candidate={} "
+            "vb_fetches={} vb_type={} vb={:08X}/{} index_owner={} "
+            "index_format={} index={:08X}/{} texture_bindings={} "
+            "unique_textures={} "
+            "resource_evidence={} guarded_bytes={} budget={} "
+            "ranges={} constants={}",
+            ps328_guard_failure_mask, ps328_candidate_capture,
+            ps328_vertex_fetch_count, ps328_vertex_fetch_type,
+            ps328_vertex_fetch_address, ps328_vertex_fetch_length,
+            uint32_t(primitive_processing_result.index_buffer_type),
+            uint32_t(primitive_processing_result.host_index_format),
+            primitive_processing_result.guest_index_base,
+            primitive_processing_result.guest_draw_vertex_count *
+                uint32_t(sizeof(uint16_t)),
+            token_context.texture_resources.size(),
+            ps328_unique_textures.size(),
+            token_context.resource_contents_valid, ps328_guarded_bytes,
+            guarded_family_spec->maximum_guarded_bytes,
+            token_state.ps328_guest_ranges.size(),
+            token_context.constant_contents_valid);
+        for (size_t texture_index = 0;
+             texture_index < token_context.texture_resources.size();
+             ++texture_index) {
+          const auto &texture =
+              token_context.texture_resources[texture_index];
+          REXLOG_INFO(
+              "  PS328 guard texture[{}]: fetch={} resident={} scaled={} "
+              "base={:08X}/{} mip={:08X}/{} key={:016X} "
+              "content_generation={} view_generation={}",
+              texture_index, texture.fetch_constant, texture.resident,
+              texture.scaled_resolve, texture.base_address,
+              texture.base_length, texture.mip_address,
+              texture.mip_length, texture.texture_key_hash,
+              texture.content_generation,
+              texture.image_view_generation);
+        }
+      }
+      if (!is_ps328_token && is_guarded_family_token &&
+          ps328_candidate_capture &&
+          !token_state.ps328_resources_guarded &&
+          !non_ps_family_state->reject_diagnostic_logged) {
+        non_ps_family_state->reject_diagnostic_logged = true;
+        REXLOG_INFO(
+            "Translated guarded family {} rejected: reasons={:08X} frame={} "
+            "vb_fetches={} index_owner={} index_format={} textures={} "
+            "unique_textures={} guarded_bytes={}/{} ranges={}/{} "
+            "constants={}",
+            uint32_t(guarded_family_spec->family),
+            ps328_guard_failure_mask, frame_current_,
+            ps328_vertex_fetch_count,
+            uint32_t(primitive_processing_result.index_buffer_type),
+            uint32_t(primitive_processing_result.host_index_format),
+            token_context.texture_resources.size(),
+            ps328_unique_textures.size(), ps328_guarded_bytes,
+            guarded_family_spec->maximum_guarded_bytes,
+            token_state.ps328_guest_ranges.size(),
+            guarded_family_spec->maximum_ranges_per_token,
+            token_context.constant_contents_valid);
+      }
+    }
+
+    token_context.guest_primitive_type = uint32_t(prim_type);
+    token_context.host_primitive_type =
+        uint32_t(primitive_processing_result.host_primitive_type);
+    token_context.processed_index_buffer_type =
+        uint32_t(primitive_processing_result.index_buffer_type);
+    token_context.host_index_format =
+        uint32_t(primitive_processing_result.host_index_format);
+    token_context.guest_vertex_or_index_count =
+        primitive_processing_result.guest_draw_vertex_count;
+    token_context.host_vertex_or_index_count = host_draw_vertex_count;
+    token_context.guest_index_base =
+        primitive_processing_result.guest_index_base;
+    token_context.indexed = host_draw_indexed;
+    token_context.guest_index_base_valid =
+        primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA ||
+        primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted;
+    if (host_draw_indexed) {
+      token_state.index_buffer = resolved_index_buffer.first;
+      token_state.index_buffer_offset = resolved_index_buffer.second;
+      token_state.index_type =
+          primitive_processing_result.host_index_format ==
+                  xenos::IndexFormat::kInt16
+              ? VK_INDEX_TYPE_UINT16
+              : VK_INDEX_TYPE_UINT32;
+    }
+
+    token_context.viewport = {
+        dynamic_viewport_.x,        dynamic_viewport_.y,
+        dynamic_viewport_.width,    dynamic_viewport_.height,
+        dynamic_viewport_.minDepth, dynamic_viewport_.maxDepth};
+    token_context.scissor_offset = {dynamic_scissor_.offset.x,
+                                    dynamic_scissor_.offset.y};
+    token_context.scissor_extent = {dynamic_scissor_.extent.width,
+                                    dynamic_scissor_.extent.height};
+    token_context.depth_bias_constant_factor =
+        dynamic_depth_bias_constant_factor_;
+    token_context.depth_bias_slope_factor = dynamic_depth_bias_slope_factor_;
+    std::copy(std::begin(dynamic_blend_constants_),
+              std::end(dynamic_blend_constants_),
+              token_context.blend_constants.begin());
+    token_context.stencil_compare_mask_front =
+        dynamic_stencil_compare_mask_front_;
+    token_context.stencil_compare_mask_back =
+        dynamic_stencil_compare_mask_back_;
+    token_context.stencil_write_mask_front =
+        dynamic_stencil_write_mask_front_;
+    token_context.stencil_write_mask_back =
+        dynamic_stencil_write_mask_back_;
+    token_context.stencil_reference_front =
+        dynamic_stencil_reference_front_;
+    token_context.stencil_reference_back =
+        dynamic_stencil_reference_back_;
+
+    const VulkanRenderTargetCache::RenderPassKey replay_render_pass_key =
+        render_target_cache_->last_update_render_pass_key();
+    const NativeRhiBorrowedRenderScopeDesc attachment_scope =
+        GetNativeGuestBorrowedRenderScope(
+        GetVulkanDevice(), render_target_cache_.get(),
+        replay_render_pass_key);
+    token_state.dynamic_rendering = attachment_scope.dynamic_rendering;
+    token_state.render_pass = attachment_scope.render_pass;
+    token_state.color_attachment_count =
+        attachment_scope.color_attachment_count;
+    std::copy(std::begin(attachment_scope.color_attachment_formats),
+              std::end(attachment_scope.color_attachment_formats),
+              std::begin(token_state.color_attachment_formats));
+    token_state.depth_attachment_format =
+        attachment_scope.depth_attachment_format;
+    token_state.stencil_attachment_format =
+        attachment_scope.stencil_attachment_format;
+    token_state.sample_count = attachment_scope.sample_count;
+    token_state.sample_mask = attachment_scope.sample_mask;
+    token_context.dynamic_rendering =
+        attachment_scope.dynamic_rendering;
+    token_context.color_attachment_count =
+        attachment_scope.color_attachment_count;
+    for (uint32_t color_index = 0;
+         color_index < token_context.color_attachment_count; ++color_index) {
+      token_context.color_attachment_formats[color_index] =
+          NativeRhiFormatFromVkFormat(
+              attachment_scope.color_attachment_formats[color_index]);
+    }
+    token_context.depth_attachment_format = NativeRhiFormatFromVkFormat(
+        attachment_scope.depth_attachment_format);
+    token_context.stencil_attachment_format = NativeRhiFormatFromVkFormat(
+        attachment_scope.stencil_attachment_format);
+    token_context.sample_count =
+        uint32_t(attachment_scope.sample_count);
+    token_context.sample_mask = attachment_scope.sample_mask;
+
+    uint32_t required_descriptor_set_mask =
+        (uint32_t(1)
+         << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram) |
+        (uint32_t(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+    if (!vertex_shader->GetTextureBindingsAfterTranslation().empty() ||
+        !vertex_shader->GetSamplerBindingsAfterTranslation().empty()) {
+      required_descriptor_set_mask |=
+          uint32_t(1)
+          << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+    }
+    if (pixel_shader != nullptr &&
+        (!pixel_shader->GetTextureBindingsAfterTranslation().empty() ||
+         !pixel_shader->GetSamplerBindingsAfterTranslation().empty())) {
+      required_descriptor_set_mask |=
+          uint32_t(1)
+          << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+    }
+    constexpr uint32_t kAllConstantBufferMask =
+        (uint32_t(1)
+         << SpirvShaderTranslator::kConstantBufferCount) -
+        1;
+    constexpr uint64_t kRectangleVertexShader =
+        UINT64_C(0x0A6D1DD7767FDF27);
+    constexpr uint64_t kRectanglePixelShader =
+        UINT64_C(0x2E372EA28CC404B7);
+    constexpr uint32_t kBaseDescriptorSetMask =
+        (uint32_t(1)
+         << SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram) |
+        (uint32_t(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+    if (replay_vertex_shader_hash == kRectangleVertexShader &&
+        replay_pixel_shader_hash == kRectanglePixelShader &&
+        required_descriptor_set_mask == kBaseDescriptorSetMask &&
+        primitive_processing_result.index_buffer_type ==
+            PrimitiveProcessor::ProcessedIndexBufferType::
+                kHostBuiltinForAuto &&
+        translated_rectangle_snapshot_valid_ &&
+        translated_rectangle_candidate_fetch_count_ == 1 &&
+        translated_rectangle_snapshot_frame_ == frame_current_) {
+      token_state.rectangle_vertex_address =
+          translated_rectangle_snapshot_address_;
+      token_state.rectangle_vertex_bytes =
+          translated_rectangle_snapshot_bytes_;
+      token_state.rectangle_vertex_snapshot_valid = true;
+      // Capture the generation after this draw's own RequestRange. The upload
+      // may consume the one-shot page watch, but exact-byte comparison remains
+      // a backend-enforced fallback. Later GPU invalidations are rejected by
+      // comparing their generation against this captured value.
+      token_state.rectangle_guard_generation =
+          translated_rectangle_guard_generation_.load(
+              std::memory_order_acquire);
+      if (translated_rectangle_guard_active_.load(
+              std::memory_order_acquire) &&
+          translated_rectangle_guard_address_ ==
+              translated_rectangle_snapshot_address_) {
+        token_state.rectangle_guarded = true;
+      }
+      token_context.resources_stable_for_deferred_replay = true;
+    }
+    enum class Ps328ContentGenerationMatch : uint8_t {
+      kNoDrift,
+      kCanonicalized,
+      kDifferentBinding,
+      kSnapshotMismatch,
+    };
+    const auto same_ps328_texture_binding_except_content_generation =
+        [](const NativeGuestTranslatedReplayTokenContext::
+               TextureResourceBinding &left,
+           const NativeGuestTranslatedReplayTokenContext::
+               TextureResourceBinding &right) {
+          return left.descriptor_binding == right.descriptor_binding &&
+                 left.fetch_constant == right.fetch_constant &&
+                 left.dimension == right.dimension &&
+                 left.is_vertex_shader == right.is_vertex_shader &&
+                 left.is_signed == right.is_signed &&
+                 left.fetch_words == right.fetch_words &&
+                 left.texture_key_hash == right.texture_key_hash &&
+                 left.base_address == right.base_address &&
+                 left.base_length == right.base_length &&
+                 left.mip_address == right.mip_address &&
+                 left.mip_length == right.mip_length &&
+                 left.width == right.width &&
+                 left.height == right.height &&
+                 left.depth_or_array_size ==
+                     right.depth_or_array_size &&
+                 left.format == right.format &&
+                 left.scaled_resolve == right.scaled_resolve &&
+                 left.image_view_generation ==
+                     right.image_view_generation &&
+                 left.resident == right.resident;
+        };
+    const auto canonicalize_ps328_content_generations =
+        [&](const NativeGuestTranslatedReplayTokenContext &expected,
+            NativeGuestTranslatedReplayTokenContext &candidate,
+            uint32_t &canonicalized_binding_count) {
+          canonicalized_binding_count = 0;
+          if (expected.texture_resources.size() !=
+              candidate.texture_resources.size()) {
+            return Ps328ContentGenerationMatch::kDifferentBinding;
+          }
+          for (size_t binding = 0;
+               binding < expected.texture_resources.size(); ++binding) {
+            const auto &expected_texture =
+                expected.texture_resources[binding];
+            const auto &candidate_texture =
+                candidate.texture_resources[binding];
+            if (!same_ps328_texture_binding_except_content_generation(
+                    expected_texture, candidate_texture)) {
+              return Ps328ContentGenerationMatch::kDifferentBinding;
+            }
+            if (expected_texture.content_generation !=
+                candidate_texture.content_generation) {
+              ++canonicalized_binding_count;
+            }
+          }
+          const auto expected_state = std::ranges::find(
+              translated_replay_token_states_, expected.opaque_token,
+              &TranslatedReplayTokenState::opaque_token);
+          if (expected_state ==
+                  translated_replay_token_states_.end() ||
+              !expected_state->ps328_resources_guarded) {
+            return Ps328ContentGenerationMatch::kSnapshotMismatch;
+          }
+          std::vector<std::pair<uint32_t, uint32_t>> checked_ranges;
+          const auto range_matches_first_block =
+              [&](uint32_t address, uint32_t length) {
+                if (length == 0) {
+                  return true;
+                }
+                if (address == 0) {
+                  return false;
+                }
+                const std::pair<uint32_t, uint32_t> identity{
+                    address, length};
+                if (std::ranges::find(checked_ranges, identity) !=
+                    checked_ranges.end()) {
+                  return true;
+                }
+                const auto snapshot = std::ranges::find_if(
+                    expected_state->ps328_guest_ranges,
+                    [&](const TranslatedReplayTokenState::StableGuestRange
+                            &range) {
+                      return range.address == address && range.bytes &&
+                             range.bytes->size() == length;
+                    });
+                if (snapshot ==
+                        expected_state->ps328_guest_ranges.end() ||
+                    !shared_memory_->GuestBytesEqual(
+                        address, length, snapshot->bytes->data())) {
+                  return false;
+                }
+                checked_ranges.push_back(identity);
+                return true;
+              };
+          for (const auto &texture : candidate.texture_resources) {
+            if (!range_matches_first_block(texture.base_address,
+                                           texture.base_length) ||
+                !range_matches_first_block(texture.mip_address,
+                                           texture.mip_length)) {
+              return Ps328ContentGenerationMatch::kSnapshotMismatch;
+            }
+          }
+          if (canonicalized_binding_count != 0) {
+            for (size_t binding = 0;
+                 binding < expected.texture_resources.size(); ++binding) {
+              candidate.texture_resources[binding].content_generation =
+                  expected.texture_resources[binding].content_generation;
+            }
+            return Ps328ContentGenerationMatch::kCanonicalized;
+          }
+          return Ps328ContentGenerationMatch::kNoDrift;
+        };
+    const auto same_ps328_logical_contract =
+        [](const NativeGuestTranslatedReplayTokenContext &left,
+           const NativeGuestTranslatedReplayTokenContext &right) {
+          const auto same_semantic_system_constants = [&]() {
+            if (left.system_constants.size() !=
+                    right.system_constants.size() ||
+                left.system_constants_mechanical_mask !=
+                    right.system_constants_mechanical_mask) {
+              return false;
+            }
+            for (size_t byte = 0; byte < left.system_constants.size();
+                 ++byte) {
+              const bool mechanical =
+                  byte < left.system_constants_mechanical_mask.size() &&
+                  left.system_constants_mechanical_mask[byte] != 0;
+              if (!mechanical &&
+                  left.system_constants[byte] !=
+                      right.system_constants[byte]) {
+                return false;
+              }
+            }
+            return true;
+          };
+          return left.pipeline_generation ==
+                     right.pipeline_generation &&
+                 left.pipeline_layout_generation ==
+                     right.pipeline_layout_generation &&
+                 left.vertex_shader_hash == right.vertex_shader_hash &&
+                 left.pixel_shader_hash == right.pixel_shader_hash &&
+                 left.vertex_shader_modification ==
+                     right.vertex_shader_modification &&
+                 left.pixel_shader_modification ==
+                     right.pixel_shader_modification &&
+                 left.vertex_float_constant_usage ==
+                     right.vertex_float_constant_usage &&
+                 left.pixel_float_constant_usage ==
+                     right.pixel_float_constant_usage &&
+                 left.vertex_float_constants ==
+                     right.vertex_float_constants &&
+                 left.pixel_float_constants ==
+                     right.pixel_float_constants &&
+                 left.bool_loop_constants ==
+                     right.bool_loop_constants &&
+                 left.fetch_constants == right.fetch_constants &&
+                 same_semantic_system_constants() &&
+                 left.constant_contents_valid ==
+                     right.constant_contents_valid &&
+                 left.texture_resources == right.texture_resources &&
+                 left.sampler_resources == right.sampler_resources &&
+                 left.resource_contents_valid ==
+                     right.resource_contents_valid &&
+                 left.guest_primitive_type ==
+                     right.guest_primitive_type &&
+                 left.host_primitive_type == right.host_primitive_type &&
+                 left.processed_index_buffer_type ==
+                     right.processed_index_buffer_type &&
+                 left.host_index_format == right.host_index_format &&
+                 left.guest_vertex_or_index_count ==
+                     right.guest_vertex_or_index_count &&
+                 left.host_vertex_or_index_count ==
+                     right.host_vertex_or_index_count &&
+                 left.guest_index_base == right.guest_index_base &&
+                 left.indexed == right.indexed &&
+                 left.guest_index_base_valid ==
+                     right.guest_index_base_valid &&
+                 std::memcmp(&left.depth_bias_constant_factor,
+                             &right.depth_bias_constant_factor,
+                             sizeof(left.depth_bias_constant_factor)) == 0 &&
+                 std::memcmp(&left.depth_bias_slope_factor,
+                             &right.depth_bias_slope_factor,
+                             sizeof(left.depth_bias_slope_factor)) == 0 &&
+                 std::memcmp(left.blend_constants.data(),
+                             right.blend_constants.data(),
+                             sizeof(left.blend_constants)) == 0 &&
+                 left.stencil_compare_mask_front ==
+                     right.stencil_compare_mask_front &&
+                 left.stencil_compare_mask_back ==
+                     right.stencil_compare_mask_back &&
+                 left.stencil_write_mask_front ==
+                     right.stencil_write_mask_front &&
+                 left.stencil_write_mask_back ==
+                     right.stencil_write_mask_back &&
+                 left.stencil_reference_front ==
+                     right.stencil_reference_front &&
+                 left.stencil_reference_back ==
+                     right.stencil_reference_back &&
+                 left.color_attachment_formats ==
+                     right.color_attachment_formats &&
+                 left.color_attachment_count ==
+                     right.color_attachment_count &&
+                 left.depth_attachment_format ==
+                     right.depth_attachment_format &&
+                 left.stencil_attachment_format ==
+                     right.stencil_attachment_format &&
+                 left.sample_count == right.sample_count &&
+                 left.sample_mask == right.sample_mask &&
+                 left.dynamic_rendering == right.dynamic_rendering;
+        };
+    if (is_guarded_family_token) {
+      auto &family_repeat_offset =
+          is_ps328_token ? translated_ps328_repeat_offset_
+                         : non_ps_family_state->repeat_offset;
+      auto &family_repeated_token_count =
+          is_ps328_token ? translated_ps328_repeated_token_count_
+                         : non_ps_family_state->repeated_token_count;
+      auto &family_guarded_candidate_count =
+          is_ps328_token
+              ? translated_ps328_guarded_candidate_count_
+              : non_ps_family_state->guarded_candidate_count;
+      auto &family_canonicalized_token_count =
+          is_ps328_token
+              ? translated_ps328_content_generation_canonicalized_tokens_
+              : non_ps_family_state->canonicalized_token_count;
+      auto &family_canonicalized_binding_count =
+          is_ps328_token
+              ? translated_ps328_content_generation_canonicalized_bindings_
+              : non_ps_family_state->canonicalized_binding_count;
+      auto &family_generation_reject_count =
+          is_ps328_token
+              ? translated_ps328_content_generation_reject_count_
+              : non_ps_family_state->generation_reject_count;
+      auto &family_proven_diagnostic_logged =
+          is_ps328_token
+              ? translated_ps328_candidate_proven_diagnostic_logged_
+              : non_ps_family_state->proven_diagnostic_logged;
+      auto &family_generation_diagnostic_logged =
+          is_ps328_token
+              ? translated_ps328_content_generation_diagnostic_logged_
+              : non_ps_family_state->generation_diagnostic_logged;
+      auto &family_generation_reject_logged =
+          is_ps328_token
+              ? translated_ps328_content_generation_reject_logged_
+              : non_ps_family_state->generation_reject_logged;
+      bool retain_candidate_guard = false;
+      const auto capture_tile_dynamic_state =
+          [](const NativeGuestTranslatedReplayTokenContext &token) {
+            GuardedReplayTileDynamicState state;
+            state.viewport = token.viewport;
+            state.ndc_scale = token.ndc_scale;
+            state.ndc_offset = token.ndc_offset;
+            state.scissor_offset = token.scissor_offset;
+            state.scissor_extent = token.scissor_extent;
+            state.system_constants = token.system_constants;
+            state.system_constants_mechanical_mask =
+                token.system_constants_mechanical_mask;
+            state.system_constants_ndc_scale_byte_offset =
+                token.system_constants_ndc_scale_byte_offset;
+            state.system_constants_ndc_offset_byte_offset =
+                token.system_constants_ndc_offset_byte_offset;
+            state.valid = token.constant_contents_valid;
+            return state;
+          };
+      const auto match_repeated_ps328_contract =
+          [&](const NativeGuestTranslatedReplayTokenContext &expected,
+              Ps328ContentGenerationMatch &generation_match) {
+            NativeGuestTranslatedReplayTokenContext canonical_candidate =
+                token_context;
+            uint32_t canonicalized_bindings = 0;
+            generation_match = canonicalize_ps328_content_generations(
+                expected, canonical_candidate,
+                canonicalized_bindings);
+            if (generation_match ==
+                    Ps328ContentGenerationMatch::kDifferentBinding ||
+                generation_match ==
+                    Ps328ContentGenerationMatch::kSnapshotMismatch ||
+                !same_ps328_logical_contract(expected,
+                                             canonical_candidate)) {
+              return false;
+            }
+            if (generation_match ==
+                Ps328ContentGenerationMatch::kCanonicalized) {
+              token_context.texture_resources =
+                  std::move(canonical_candidate.texture_resources);
+              ++family_canonicalized_token_count;
+              family_canonicalized_binding_count += canonicalized_bindings;
+              if (!family_generation_diagnostic_logged) {
+                family_generation_diagnostic_logged = true;
+                REXLOG_INFO(
+                    "Translated guarded-family {} repeated texture generations "
+                    "canonicalized: frame={} token={} bindings={} "
+                    "byte_proof=true observer_evidence_canonical=true",
+                    uint32_t(guarded_family_spec->family), frame_current_,
+                    token_context.opaque_token,
+                    canonicalized_bindings);
+              }
+            }
+            return true;
+          };
+      const auto reject_ps328_content_generation_canonicalization =
+          [&]() {
+            ++family_generation_reject_count;
+            if (!family_generation_reject_logged) {
+              family_generation_reject_logged = true;
+              REXLOG_INFO(
+                  "Translated guarded-family {} repeated texture generation "
+                  "canonicalization rejected: frame={} token={} phase={} "
+                  "repeat_offset={} byte_or_range_mismatch=true",
+                  uint32_t(guarded_family_spec->family), frame_current_,
+                  token_context.opaque_token,
+                  uint32_t(guarded_family_phase), family_repeat_offset);
+            }
+          };
+      switch (guarded_family_phase) {
+        case GuardedReplayCandidatePhase::kCollectingFirstBlock: {
+          Ps328ContentGenerationMatch generation_match =
+              Ps328ContentGenerationMatch::kDifferentBinding;
+          if (!guarded_family_contracts.empty() &&
+              match_repeated_ps328_contract(
+                  guarded_family_contracts.front(),
+                  generation_match)) {
+            if (guarded_family_normalization_evidence.size() !=
+                guarded_family_contracts.size()) {
+              guarded_family_phase =
+                  GuardedReplayCandidatePhase::kRejected;
+              break;
+            }
+            guarded_family_normalization_evidence[0][1] =
+                capture_tile_dynamic_state(token_context);
+            guarded_family_phase =
+                GuardedReplayCandidatePhase::kMatchingSecondBlock;
+            family_repeat_offset = 1;
+            ++family_repeated_token_count;
+          } else if (generation_match ==
+                     Ps328ContentGenerationMatch::kSnapshotMismatch) {
+            reject_ps328_content_generation_canonicalization();
+            guarded_family_phase = GuardedReplayCandidatePhase::kRejected;
+          } else if (guarded_family_contracts.size() >=
+                     guarded_family_spec->maximum_first_block_tokens) {
+            guarded_family_phase =
+                GuardedReplayCandidatePhase::kRejected;
+          } else {
+            guarded_family_contracts.push_back(token_context);
+            GuardedReplayNormalizationEvidence evidence{};
+            evidence[0] = capture_tile_dynamic_state(token_context);
+            guarded_family_normalization_evidence.push_back(
+                std::move(evidence));
+            retain_candidate_guard =
+                token_state.ps328_resources_guarded;
+            if (!retain_candidate_guard) {
+              guarded_family_phase =
+                  GuardedReplayCandidatePhase::kRejected;
+            }
+          }
+          break;
+        }
+        case GuardedReplayCandidatePhase::kMatchingSecondBlock:
+        case GuardedReplayCandidatePhase::kMatchingThirdBlock: {
+          Ps328ContentGenerationMatch generation_match =
+              Ps328ContentGenerationMatch::kDifferentBinding;
+          if (family_repeat_offset >=
+                  guarded_family_contracts.size() ||
+              !match_repeated_ps328_contract(
+                  guarded_family_contracts[family_repeat_offset],
+                  generation_match)) {
+            if (generation_match ==
+                Ps328ContentGenerationMatch::kSnapshotMismatch) {
+              reject_ps328_content_generation_canonicalization();
+            }
+            guarded_family_phase =
+                GuardedReplayCandidatePhase::kRejected;
+            family_repeat_offset = 0;
+            break;
+          }
+          if (guarded_family_normalization_evidence.size() !=
+              guarded_family_contracts.size()) {
+            guarded_family_phase =
+                GuardedReplayCandidatePhase::kRejected;
+            family_repeat_offset = 0;
+            break;
+          }
+          const size_t tile_index =
+              guarded_family_phase ==
+                      GuardedReplayCandidatePhase::kMatchingSecondBlock
+                  ? 1
+                  : 2;
+          guarded_family_normalization_evidence[family_repeat_offset]
+                                                [tile_index] =
+              capture_tile_dynamic_state(token_context);
+          ++family_repeat_offset;
+          ++family_repeated_token_count;
+          if (family_repeat_offset ==
+              guarded_family_contracts.size()) {
+            if (guarded_family_phase ==
+                GuardedReplayCandidatePhase::kMatchingSecondBlock) {
+              guarded_family_phase =
+                  GuardedReplayCandidatePhase::kMatchingThirdBlock;
+              family_repeat_offset = 0;
+            } else {
+              guarded_family_phase =
+                  GuardedReplayCandidatePhase::kProven;
+              family_repeat_offset = 0;
+              if (is_ps328_token) {
+                translated_ps328_candidate_summary_logged_ = true;
+              }
+              if (!family_proven_diagnostic_logged) {
+                family_proven_diagnostic_logged = true;
+                REXLOG_INFO(
+                    "Translated guarded-family {} candidate guard proven: "
+                    "frame={} first_block_tokens={} repeated_tokens={} "
+                    "shared_bytes={} "
+                    "aggregate_budget={} canonicalized_tokens={} "
+                    "canonicalized_bindings={} generation_rejects={}",
+                    uint32_t(guarded_family_spec->family), frame_current_,
+                    family_guarded_candidate_count,
+                    family_repeated_token_count, guarded_family_bytes,
+                    guarded_family_spec->maximum_guarded_bytes,
+                    family_canonicalized_token_count,
+                    family_canonicalized_binding_count,
+                    family_generation_reject_count);
+              }
+            }
+          }
+          break;
+        }
+        case GuardedReplayCandidatePhase::kProven:
+        case GuardedReplayCandidatePhase::kRejected:
+          break;
+      }
+      if (retain_candidate_guard) {
+        guarded_family_bytes += ps328_new_guarded_bytes;
+        ++family_guarded_candidate_count;
+        if (!is_ps328_token) {
+          guarded_family_range_count +=
+              token_state.ps328_guest_ranges.size();
+        }
+      } else {
+        // Repeated tile instances are evidence only. They never retain a
+        // private byte snapshot or become replay-stable candidates.
+        token_state.ps328_guest_ranges.clear();
+        token_state.ps328_texture_resources.clear();
+        token_state.ps328_resources_guarded = false;
+      }
+    }
+    if (is_guarded_family_token &&
+        token_state.ps328_resources_guarded &&
+        token_context.resource_contents_valid &&
+        token_context.constant_contents_valid) {
+      token_context.resources_stable_for_deferred_replay = true;
+    }
+    if (!translated_rectangle_stability_diagnostic_logged_ &&
+        replay_vertex_shader_hash == kRectangleVertexShader &&
+        replay_pixel_shader_hash == kRectanglePixelShader) {
+      translated_rectangle_stability_diagnostic_logged_ = true;
+      REXLOG_INFO(
+          "Translated rectangle stability: fetch_seen={} fetch={} type={} "
+          "size={} address={:08X} translated={} candidates={} snapshot_valid={} "
+          "snapshot_frame={} token_frame={} required_sets={:X} base_sets={:X} "
+          "processed_index={} builtin_auto={} guard_active={} stable={}",
+          translated_rectangle_fetch_seen_,
+          translated_rectangle_fetch_index_,
+          translated_rectangle_fetch_type_,
+          translated_rectangle_fetch_size_bytes_,
+          translated_rectangle_fetch_address_,
+          translated_rectangle_fetch_translate_valid_,
+          translated_rectangle_candidate_fetch_count_,
+          translated_rectangle_snapshot_valid_,
+          translated_rectangle_snapshot_frame_, frame_current_,
+          required_descriptor_set_mask, kBaseDescriptorSetMask,
+          uint32_t(primitive_processing_result.index_buffer_type),
+          uint32_t(PrimitiveProcessor::ProcessedIndexBufferType::
+                       kHostBuiltinForAuto),
+          translated_rectangle_guard_active_.load(
+              std::memory_order_acquire),
+          token_context.resources_stable_for_deferred_replay);
+    }
+    token_context.valid =
+        token_context.backend_frame_sequence != 0 &&
+        token_context.opaque_token != 0 &&
+        token_context.pipeline_generation != 0 &&
+        token_context.pipeline_layout_generation != 0 &&
+        (token_context.descriptor_set_valid_mask &
+         required_descriptor_set_mask) == required_descriptor_set_mask &&
+        (token_context.constant_buffer_valid_mask &
+         kAllConstantBufferMask) == kAllConstantBufferMask &&
+        token_context.constant_contents_valid &&
+        token_context.resource_contents_valid &&
+        (!host_draw_indexed ||
+         token_state.index_buffer != VK_NULL_HANDLE) &&
+        (token_context.dynamic_rendering ||
+         token_state.render_pass != VK_NULL_HANDLE) &&
+        token_context.color_attachment_count <=
+            NativeGuestTranslatedReplayTokenContext::kMaxColorAttachments;
+    if (token_context.valid) {
+      token_state.public_context = token_context;
+      translated_replay_token_states_.push_back(token_state);
+      ObserveNativeGuestTranslatedReplayToken(token_context);
+    }
+  }
+  if (IsBuiltInGuardedReplayFamily(
+          vertex_shader->ucode_data_hash(),
+          pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0) &&
+      !in_render_pass_) {
+    // Guarded capture is an observer between render-pass entry and the guest
+    // draw. Never emit the draw outside its pass if a future capture helper
+    // accidentally records a barrier or upload here.
+    return draw_fail("guarded_capture_ended_render_pass");
+  }
+
+  // Observer-only, post-pipeline state tap. This runs after render-target,
+  // pipeline, texture, viewport and scissor setup, but before selective
+  // replacement and before the guest draw itself. It deliberately exposes
+  // value copies only and therefore cannot mutate or suppress the draw.
+  if (HasNativeGuestDrawStateObserver() &&
+      ShouldObserveNativeGuestDrawState(
+          vertex_shader->ucode_data_hash(),
+          pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0) &&
+      render_target_cache_->GetPath() ==
+          RenderTargetCache::Path::kHostRenderTargets) {
+    NativeGuestDrawStateContext state_context;
+    NativeGuestDrawContext& native_draw_context = state_context.draw;
+    native_draw_context.backend = NativeGuestOutputBackend::kVulkan;
+    native_draw_context.backend_frame_sequence = frame_current_;
+    native_draw_context.vertex_shader_hash =
+        vertex_shader->ucode_data_hash();
+    native_draw_context.pixel_shader_hash =
+        pixel_shader != nullptr ? pixel_shader->ucode_data_hash() : 0;
+    native_draw_context.primitive_type = uint32_t(prim_type);
+    native_draw_context.guest_vertex_or_index_count =
+        primitive_processing_result.guest_draw_vertex_count;
+    native_draw_context.vertex_or_index_count = host_draw_vertex_count;
+    native_draw_context.guest_index_base =
+        primitive_processing_result.guest_index_base;
+    native_draw_context.guest_index_base_valid =
+        primitive_processing_result.index_buffer_type !=
+            PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+        primitive_processing_result.index_buffer_type !=
+            PrimitiveProcessor::ProcessedIndexBufferType::
+                kHostBuiltinForAuto;
+    native_draw_context.indexed =
+        primitive_processing_result.index_buffer_type !=
+            PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
+        !shader_32bit_index_dma;
+    const VulkanRenderTargetCache::RenderPassKey state_render_pass_key =
+        render_target_cache_->last_update_render_pass_key();
+    native_draw_context.render_pass_key = state_render_pass_key.key;
+    native_draw_context.render_pass_key_valid = true;
+    PopulateNativeGuestDrawStateContract(
+        native_draw_context, regs, normalized_depth_control,
+        normalized_color_mask, primitive_processing_result);
+    PopulateNativeGuestRenderTargetState(native_draw_context, regs);
+    PopulateNativeGuestVertexFetchIdentity(native_draw_context, regs);
+    const NativeRhiBorrowedRenderScopeDesc state_scope =
+        GetNativeGuestBorrowedRenderScope(
+            GetVulkanDevice(), render_target_cache_.get(),
+            state_render_pass_key);
+    PopulateNativeGuestBorrowedAttachmentContract(native_draw_context,
+                                                  state_scope);
+
+    state_context.viewport_offset = {
+        viewport_info.xy_offset[0], viewport_info.xy_offset[1]};
+    state_context.viewport_extent = {
+        viewport_info.xy_extent[0], viewport_info.xy_extent[1]};
+    state_context.viewport_min_depth = viewport_info.z_min;
+    state_context.viewport_max_depth = viewport_info.z_max;
+    state_context.ndc_scale = {viewport_info.ndc_scale[0],
+                               viewport_info.ndc_scale[1],
+                               viewport_info.ndc_scale[2]};
+    state_context.ndc_offset = {viewport_info.ndc_offset[0],
+                                viewport_info.ndc_offset[1],
+                                viewport_info.ndc_offset[2]};
+    draw_util::Scissor state_scissor;
+    draw_util::GetScissor(regs, state_scissor);
+    const uint32_t draw_resolution_scale_x =
+        texture_cache_->draw_resolution_scale_x();
+    const uint32_t draw_resolution_scale_y =
+        texture_cache_->draw_resolution_scale_y();
+    state_context.scissor_offset = {
+        state_scissor.offset[0] * draw_resolution_scale_x,
+        state_scissor.offset[1] * draw_resolution_scale_y};
+    state_context.scissor_extent = {
+        state_scissor.extent[0] * draw_resolution_scale_x,
+        state_scissor.extent[1] * draw_resolution_scale_y};
+    state_context.viewport_scissor_valid = true;
+
+    state_context.active_texture_fetch_mask = used_texture_mask;
+    uint32_t remaining_texture_fetches = used_texture_mask;
+    while (remaining_texture_fetches != 0) {
+      uint32_t fetch_index;
+      if (!rex::bit_scan_forward(remaining_texture_fetches, &fetch_index)) {
+        break;
+      }
+      remaining_texture_fetches &= ~(uint32_t(1) << fetch_index);
+      const uint32_t* fetch_words =
+          &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 +
+                NativeGuestDrawStateContext::kTextureFetchWordCount *
+                    fetch_index];
+      for (uint32_t word = 0;
+           word < NativeGuestDrawStateContext::kTextureFetchWordCount;
+           ++word) {
+        state_context.texture_fetch_words[fetch_index][word] =
+            fetch_words[word];
+      }
+    }
+    state_context.texture_fetches_valid = true;
+    state_context.valid =
+        native_draw_context.backend_frame_sequence != 0 &&
+        native_draw_context.vertex_shader_hash != 0 &&
+        native_draw_context.render_pass_key_valid &&
+        native_draw_context.draw_state_contract_valid &&
+        native_draw_context.render_target_state.valid &&
+        native_draw_context.borrowed_attachment_contract_valid &&
+        state_context.viewport_scissor_valid &&
+        state_context.texture_fetches_valid;
+    ObserveNativeGuestDrawState(state_context);
+  }
+
   const bool native_replacement_indexed =
       primitive_processing_result.index_buffer_type !=
           PrimitiveProcessor::ProcessedIndexBufferType::kNone &&
@@ -5306,8 +8733,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         primitive_processing_result.index_buffer_type !=
             PrimitiveProcessor::ProcessedIndexBufferType::
                 kHostBuiltinForAuto;
-    native_draw_context.surface_pitch =
-        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
     const VulkanRenderTargetCache::RenderPassKey render_pass_key =
         render_target_cache_->last_update_render_pass_key();
     native_draw_context.render_pass_key = render_pass_key.key;
@@ -5316,6 +8741,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     PopulateNativeGuestDrawStateContract(
         native_draw_context, regs, normalized_depth_control,
         normalized_color_mask, primitive_processing_result);
+    PopulateNativeGuestRenderTargetState(native_draw_context, regs);
     PopulateNativeGuestVertexFetchIdentity(native_draw_context, regs);
     const NativeRhiBorrowedRenderScopeDesc scope =
         GetNativeGuestBorrowedRenderScope(
@@ -5375,33 +8801,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     deferred_command_buffer_.CmdVkDraw(host_draw_vertex_count, 1, 0, 0);
   } else {
     rex::perf::ScopedCounterTimer stage_timer(rex::perf::CounterId::kDrawStageSubmitUs);
-    std::pair<VkBuffer, VkDeviceSize> index_buffer;
-    switch (primitive_processing_result.index_buffer_type) {
-      case PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA:
-        if (guest_dma_index_scratch_buffer.buffer() != VK_NULL_HANDLE) {
-          index_buffer.first = guest_dma_index_scratch_buffer.buffer();
-          index_buffer.second = 0;
-        } else {
-          index_buffer.first = shared_memory_->buffer();
-          index_buffer.second = primitive_processing_result.guest_index_base;
-        }
-        break;
-      case PrimitiveProcessor::ProcessedIndexBufferType::kHostConverted:
-        index_buffer = primitive_processor_->GetConvertedIndexBuffer(
-            primitive_processing_result.host_index_buffer_handle);
-        break;
-      case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForAuto:
-      case PrimitiveProcessor::ProcessedIndexBufferType::kHostBuiltinForDMA:
-        index_buffer = primitive_processor_->GetBuiltinIndexBuffer(
-            primitive_processing_result.host_index_buffer_handle);
-        break;
-      default:
-        assert_unhandled_case(primitive_processing_result.index_buffer_type);
-        return draw_fail("unexpected_index_buffer_type");
-    }
     if (!native_draw_replaced) {
       deferred_command_buffer_.CmdVkBindIndexBuffer(
-          index_buffer.first, index_buffer.second,
+          resolved_index_buffer.first, resolved_index_buffer.second,
           primitive_processing_result.host_index_format ==
                   xenos::IndexFormat::kInt16
               ? VK_INDEX_TYPE_UINT16
@@ -7431,6 +10833,85 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+    // Tokens contain borrowed backend objects and are valid for exactly one
+    // guest frame. Expire them at the frame boundary even if no matching draw
+    // is observed in the new frame.
+    if (!translated_ps328_candidate_summary_logged_ &&
+        !translated_ps328_candidate_reject_diagnostic_logged_ &&
+        translated_ps328_guarded_candidate_count_ != 0) {
+      translated_ps328_candidate_summary_logged_ = true;
+      translated_ps328_candidate_reject_diagnostic_logged_ = true;
+      REXLOG_INFO(
+          "Translated PS328 candidate guard summary: frame={} phase={} "
+          "tile1_candidates={} repeated_tokens={} shared_bytes={} "
+          "aggregate_budget={} canonicalized_tokens={} "
+          "canonicalized_bindings={} generation_rejects={} "
+          "fail_closed={}",
+          translated_replay_token_frame_,
+          uint32_t(translated_ps328_candidate_phase_),
+          translated_ps328_guarded_candidate_count_,
+          translated_ps328_repeated_token_count_,
+          translated_ps328_guarded_bytes_, size_t(32 * 1024 * 1024),
+          translated_ps328_content_generation_canonicalized_tokens_,
+          translated_ps328_content_generation_canonicalized_bindings_,
+          translated_ps328_content_generation_reject_count_,
+          translated_ps328_candidate_phase_ !=
+              GuardedReplayCandidatePhase::kProven);
+    }
+    const auto summarize_guarded_family =
+        [&](NativeGuestGuardedReplayFamily family,
+            GuardedReplayFamilyFrameState &state, size_t byte_budget,
+            size_t range_budget) {
+          if (state.guarded_candidate_count == 0 ||
+              state.proven_diagnostic_logged ||
+              state.reject_diagnostic_logged) {
+            return;
+          }
+          state.reject_diagnostic_logged = true;
+          REXLOG_INFO(
+              "Translated guarded-family {} candidate guard summary: "
+              "frame={} phase={} first_block_candidates={} "
+              "repeated_tokens={} shared_bytes={}/{} ranges={}/{} "
+              "canonicalized_tokens={} canonicalized_bindings={} "
+              "generation_rejects={} fail_closed={}",
+              uint32_t(family), translated_replay_token_frame_,
+              uint32_t(state.phase), state.guarded_candidate_count,
+              state.repeated_token_count, state.guarded_bytes, byte_budget,
+              state.retained_range_count, range_budget,
+              state.canonicalized_token_count,
+              state.canonicalized_binding_count,
+              state.generation_reject_count,
+              state.phase != GuardedReplayCandidatePhase::kProven);
+        };
+    for (GuardedReplayFamilyEntry &entry : translated_guarded_families_) {
+      summarize_guarded_family(
+          entry.spec.family, entry.state, entry.spec.maximum_guarded_bytes,
+          entry.spec.maximum_frame_ranges);
+    }
+    // Must precede the token-state clear: promotion compares this frame's
+    // captured resources against the retained ones.
+    UpdateGuardedReplayFamilyPromotions();
+    translated_replay_token_states_.clear();
+    translated_replay_pipeline_generations_.clear();
+    translated_replay_pipeline_layout_generations_.clear();
+    translated_replay_descriptor_generations_.clear();
+    translated_replay_buffer_generations_.clear();
+    translated_replay_image_view_generations_.clear();
+    translated_replay_object_generation_next_ = 1;
+    translated_ps328_candidate_phase_ =
+        GuardedReplayCandidatePhase::kCollectingFirstBlock;
+    translated_ps328_first_block_contracts_.clear();
+    translated_ps328_normalization_evidence_.clear();
+    translated_ps328_repeat_offset_ = 0;
+    translated_ps328_guarded_bytes_ = 0;
+    translated_ps328_guarded_candidate_count_ = 0;
+    translated_ps328_repeated_token_count_ = 0;
+    translated_ps328_content_generation_canonicalized_tokens_ = 0;
+    translated_ps328_content_generation_canonicalized_bindings_ = 0;
+    translated_ps328_content_generation_reject_count_ = 0;
+    ResetGuardedReplayFamiliesForNewFrame();
+    translated_ps328_candidate_summary_logged_ = false;
+    translated_replay_token_frame_ = frame_current_;
     frame_used_async_placeholder_pipeline_ = false;
     debug_frame_draws_ = 0;
     debug_frame_copy_resolves_ = 0;

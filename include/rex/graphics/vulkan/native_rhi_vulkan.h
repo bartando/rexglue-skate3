@@ -86,4 +86,21 @@ nrhi::Cmd* NativeRhiBeginBorrowedRenderScope(
     nrhi::Device* device, const NativeRhiBorrowedRenderScopeDesc& desc);
 void NativeRhiEndBorrowedRenderScope(nrhi::Device* device);
 
+// Opens/closes a Vulkan dynamic-rendering scope on caller-owned NRHI
+// attachments for backend translated replay. The implementation validates and
+// unwraps the attachments internally; no Vulkan image or view escapes.
+bool NativeRhiBeginTranslatedReplayScope(
+    nrhi::Device* device, nrhi::Texture* color,
+    nrhi::Texture* depth_stencil, nrhi::Format color_format,
+    nrhi::Format depth_stencil_format, uint32_t width, uint32_t height,
+    uint32_t sample_count, bool clear_color, const float clear_color_value[4],
+    bool clear_depth_stencil, float clear_depth_value,
+    uint32_t clear_stencil_value);
+bool NativeRhiCanBeginTranslatedReplayScope(
+    nrhi::Device* device, nrhi::Texture* color,
+    nrhi::Texture* depth_stencil, nrhi::Format color_format,
+    nrhi::Format depth_stencil_format, uint32_t width, uint32_t height,
+    uint32_t sample_count, const float clear_color_value[4]);
+void NativeRhiEndTranslatedReplayScope(nrhi::Device* device);
+
 }  // namespace rex::graphics::vulkan

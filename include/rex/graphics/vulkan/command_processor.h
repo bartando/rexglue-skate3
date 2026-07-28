@@ -24,6 +24,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/native_guest_renderer.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -49,6 +50,30 @@ class Device;
 }
 
 namespace rex::graphics::vulkan {
+
+// Budgets and shader identity for one guarded three-tile replay family.
+//
+// The four originally reverse-engineered families keep their individually
+// tuned budgets. Every other MAIN shader pair is discovered at run time and
+// seeded from `kGuardedGenericFamilySpec`, so covering a new family no longer
+// requires a bespoke observer.
+struct GuardedReplayFamilySpec {
+  NativeGuestGuardedReplayFamily family =
+      NativeGuestGuardedReplayFamily::kUnknown;
+  std::array<uint64_t, 2> vertex_shader_hashes{};
+  size_t vertex_shader_count = 0;
+  uint64_t pixel_shader_hash = 0;
+  size_t maximum_first_block_tokens = 0;
+  size_t maximum_guarded_bytes = 0;
+  size_t maximum_ranges_per_token = 0;
+  size_t maximum_frame_ranges = 0;
+  size_t minimum_unique_textures = 0;
+  size_t maximum_unique_textures = 0;
+  // Discovered families share one frame-wide byte budget instead of each
+  // owning a private allowance, so generic capture cannot grow without bound
+  // as more of the MAIN pass is admitted.
+  bool shares_generic_byte_budget = false;
+};
 
 class VulkanCommandProcessor : public CommandProcessor {
  public:
@@ -151,6 +176,30 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
+
+  NativeGuestTranslatedReplayResult ReplayNativeGuestTranslatedDraw(
+      const NativeGuestOutputRenderContext& output_context,
+      const NativeGuestTranslatedReplayTokenContext& token,
+      const NativeGuestTranslatedReplayTarget& target);
+  NativeGuestTranslatedReplayResult ReplayNativeGuestTranslatedDrawBatch(
+      const NativeGuestOutputRenderContext& output_context,
+      const std::vector<NativeGuestTranslatedReplayTokenContext>& tokens,
+      const NativeGuestTranslatedReplayTarget& target);
+  void InvalidateGraphicsStateAfterTranslatedReplay();
+  bool GetCurrentFrameGuardedPs328Tile1ReplayTokens(
+      uint64_t backend_frame_sequence,
+      std::vector<NativeGuestTranslatedReplayTokenContext>& tokens) const;
+  bool GetCurrentFrameGuardedReplayPacket(
+      NativeGuestGuardedReplayFamily family,
+      uint64_t backend_frame_sequence,
+      NativeGuestGuardedReplayPacket& packet) const;
+  // Every proven guarded family in this frame, merged into one globally
+  // ordered tile-one plan. Individual families that fail their three-tile
+  // proof are reported in `batch.families` and excluded from the plan rather
+  // than failing the whole batch, so the uncovered remainder is measurable.
+  bool GetCurrentFrameGuardedMainReplayBatch(
+      uint64_t backend_frame_sequence,
+      NativeGuestGuardedMainReplayBatch& batch) const;
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -284,6 +333,10 @@ class VulkanCommandProcessor : public CommandProcessor {
 
  private:
   friend class VulkanTextureCache;
+  static void TranslatedRectangleWatchCallback(
+      const std::unique_lock<std::recursive_mutex>& global_lock,
+      void* context, void* data, uint64_t argument,
+      bool invalidated_by_gpu);
 
   struct CommandBuffer {
     VkCommandPool pool;
@@ -967,6 +1020,225 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   // System shader constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
+
+  // Frame-scoped backend storage for opaque translated replay tokens. No
+  // Vulkan object in this state crosses the native guest-renderer API.
+  struct TranslatedReplayTokenState {
+    struct StableGuestRange {
+      uint32_t address = 0;
+      std::shared_ptr<const std::vector<uint8_t>> bytes;
+    };
+    NativeGuestTranslatedReplayTokenContext public_context{};
+    uint64_t opaque_token = 0;
+    uint64_t frame = 0;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const PipelineLayout* pipeline_layout = nullptr;
+    VkDescriptorSet descriptor_sets[
+        SpirvShaderTranslator::kDescriptorSetCount] = {};
+    VkDescriptorBufferInfo constant_buffers[
+        SpirvShaderTranslator::kConstantBufferCount] = {};
+    bool constants_push_descriptors = false;
+    VkBuffer index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize index_buffer_offset = 0;
+    VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+    bool dynamic_rendering = false;
+    VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkFormat color_attachment_formats[4] = {};
+    uint32_t color_attachment_count = 0;
+    VkFormat depth_attachment_format = VK_FORMAT_UNDEFINED;
+    VkFormat stencil_attachment_format = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlagBits sample_count = VK_SAMPLE_COUNT_1_BIT;
+    uint64_t sample_mask = UINT64_MAX;
+    uint64_t rectangle_guard_generation = 0;
+    bool rectangle_guarded = false;
+    uint32_t rectangle_vertex_address = 0;
+    std::array<uint8_t, 84> rectangle_vertex_bytes{};
+    bool rectangle_vertex_snapshot_valid = false;
+    // Bounded exact-byte guards for a provisional first-block PS328 logical
+    // candidate. Shared storage snapshots are reference-deduped across the
+    // frame and revalidated immediately before replay; no guest pointer
+    // escapes through the public token.
+    std::vector<StableGuestRange> ps328_guest_ranges;
+    std::vector<
+        NativeGuestTranslatedReplayTokenContext::TextureResourceBinding>
+        ps328_texture_resources;
+    bool ps328_resources_guarded = false;
+  };
+  uint64_t translated_replay_token_frame_ = 0;
+  uint64_t translated_replay_token_next_ = 1;
+  uint64_t translated_replay_object_generation_next_ = 1;
+  std::vector<TranslatedReplayTokenState> translated_replay_token_states_;
+  std::unordered_map<VkPipeline, uint64_t>
+      translated_replay_pipeline_generations_;
+  std::unordered_map<const PipelineLayout*, uint64_t>
+      translated_replay_pipeline_layout_generations_;
+  std::unordered_map<VkDescriptorSet, uint64_t>
+      translated_replay_descriptor_generations_;
+  std::unordered_map<VkBuffer, uint64_t>
+      translated_replay_buffer_generations_;
+  std::unordered_map<VkImageView, uint64_t>
+      translated_replay_image_view_generations_;
+  enum class GuardedReplayCandidatePhase : uint8_t {
+    kCollectingFirstBlock,
+    kMatchingSecondBlock,
+    kMatchingThirdBlock,
+    kProven,
+    kRejected,
+  };
+  struct GuardedReplayTileDynamicState {
+    std::array<float, 6> viewport{};
+    std::array<float, 3> ndc_scale{};
+    std::array<float, 3> ndc_offset{};
+    std::array<int32_t, 2> scissor_offset{};
+    std::array<uint32_t, 2> scissor_extent{};
+    std::vector<uint8_t> system_constants;
+    std::vector<uint8_t> system_constants_mechanical_mask;
+    uint32_t system_constants_ndc_scale_byte_offset = 0;
+    uint32_t system_constants_ndc_offset_byte_offset = 0;
+    bool valid = false;
+  };
+  using GuardedReplayNormalizationEvidence =
+      std::array<GuardedReplayTileDynamicState, 3>;
+  struct GuardedReplayFamilyFrameState {
+    GuardedReplayCandidatePhase phase =
+        GuardedReplayCandidatePhase::kCollectingFirstBlock;
+    std::vector<NativeGuestTranslatedReplayTokenContext>
+        first_block_contracts;
+    std::vector<GuardedReplayNormalizationEvidence>
+        normalization_evidence;
+    size_t repeat_offset = 0;
+    size_t guarded_bytes = 0;
+    size_t retained_range_count = 0;
+    uint32_t guarded_candidate_count = 0;
+    uint32_t repeated_token_count = 0;
+    uint32_t canonicalized_token_count = 0;
+    uint32_t canonicalized_binding_count = 0;
+    uint32_t generation_reject_count = 0;
+    // Cross-frame, and therefore preserved by the per-frame reset. A family
+    // that never proves is abandoned so generic capture cannot keep paying
+    // for draws that will never join the plan.
+    uint32_t consecutive_unproven_frames = 0;
+    bool abandoned = false;
+    bool ever_proven = false;
+    bool proven_diagnostic_logged = false;
+    bool reject_diagnostic_logged = false;
+    bool generation_diagnostic_logged = false;
+    bool generation_reject_logged = false;
+  };
+  GuardedReplayCandidatePhase translated_ps328_candidate_phase_ =
+      GuardedReplayCandidatePhase::kCollectingFirstBlock;
+  std::vector<NativeGuestTranslatedReplayTokenContext>
+      translated_ps328_first_block_contracts_;
+  std::vector<GuardedReplayNormalizationEvidence>
+      translated_ps328_normalization_evidence_;
+  size_t translated_ps328_repeat_offset_ = 0;
+  size_t translated_ps328_guarded_bytes_ = 0;
+  uint32_t translated_ps328_guarded_candidate_count_ = 0;
+  uint32_t translated_ps328_repeated_token_count_ = 0;
+  uint32_t translated_ps328_content_generation_canonicalized_tokens_ = 0;
+  uint32_t translated_ps328_content_generation_canonicalized_bindings_ = 0;
+  uint32_t translated_ps328_content_generation_reject_count_ = 0;
+  bool translated_ps328_candidate_summary_logged_ = false;
+  bool translated_ps328_candidate_proven_diagnostic_logged_ = false;
+  bool translated_ps328_candidate_reject_diagnostic_logged_ = false;
+  bool translated_ps328_content_generation_diagnostic_logged_ = false;
+  bool translated_ps328_content_generation_reject_logged_ = false;
+  mutable uint64_t translated_ps328_query_failure_signature_ = UINT64_MAX;
+  // What a family looked like on the previous frame, retained so the next
+  // frame can be checked against it.
+  //
+  // This is the evidence for the promotion design: a native frame can only
+  // outlive guest draw capture if the expensive inputs - geometry bytes,
+  // texture payloads, pipeline identity - are the same frame to frame, with
+  // only the cheap inputs (constants: camera, transforms) changing. The three
+  // fingerprints are kept apart precisely so "geometry is stable but
+  // constants move" is measurable rather than assumed.
+  struct GuardedReplayFamilyPromotion {
+    struct TokenFingerprint {
+      uint64_t geometry = 0;
+      // Which textures are bound, ignoring their upload generation.
+      uint64_t texture_identity = 0;
+      // Identity plus the backend's content generation. Divergence between
+      // the two means the same texture is being re-uploaded rather than
+      // genuinely changing - which is the cost a persistent cache removes.
+      uint64_t textures = 0;
+      uint64_t constants = 0;
+    };
+    bool valid = false;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const PipelineLayout* pipeline_layout = nullptr;
+    std::vector<TokenFingerprint> tokens;
+    uint32_t frames_observed = 0;
+    uint32_t frames_pipeline_changed = 0;
+    uint32_t frames_count_changed = 0;
+    uint32_t frames_geometry_changed = 0;
+    uint32_t frames_texture_identity_changed = 0;
+    uint32_t frames_textures_changed = 0;
+    uint32_t frames_constants_changed = 0;
+    uint32_t last_reported_frames = 0;
+  };
+  struct GuardedReplayFamilyEntry {
+    GuardedReplayFamilySpec spec;
+    GuardedReplayFamilyFrameState state;
+    GuardedReplayFamilyPromotion promotion;
+  };
+  // Seeded with the three tuned non-PS328 families and then extended with
+  // discovered MAIN families while generic capture is enabled. Entries persist
+  // across frames so a family keeps its identity and one-shot diagnostics;
+  // only the per-frame counters in `state` are reset.
+  std::vector<GuardedReplayFamilyEntry> translated_guarded_families_;
+  void EnsureGuardedReplayFamilySeeds();
+  // Clears per-frame guarded family counters while carrying the cross-frame
+  // abandonment accounting and one-shot diagnostic latches forward.
+  void ResetGuardedReplayFamiliesForNewFrame();
+  // Compares this frame's proven families against their retained promotion and
+  // accumulates what changed. Must run while the frame's token states are
+  // still alive, i.e. before they are cleared.
+  void UpdateGuardedReplayFamilyPromotions();
+  void ReportGuardedTexturePayloadStability();
+  size_t FindGuardedReplayFamilyIndex(uint64_t vertex_shader_hash,
+                                      uint64_t pixel_shader_hash) const;
+  // Returns `translated_guarded_families_.size()` when the shader pair is
+  // neither seeded nor admissible as a new discovered family.
+  size_t FindOrCreateGuardedReplayFamilyIndex(uint64_t vertex_shader_hash,
+                                              uint64_t pixel_shader_hash);
+  bool BuildGuardedReplayFamilyPacket(
+      size_t family_index, uint64_t backend_frame_sequence,
+      NativeGuestGuardedReplayPacket& packet) const;
+  // Proves that the three observed tile blocks differ only in mechanical tile
+  // geometry, and fills `packet.normalized_tokens` with full-output copies.
+  bool ProveGuardedFullOutputNormalization(
+      const std::vector<GuardedReplayNormalizationEvidence>& evidence,
+      NativeGuestGuardedReplayPacket& packet) const;
+  // Direct evidence for the redundant-upload claim: the guest-memory texels
+  // behind each bound texture, hashed and compared across frames. Identity
+  // holding while the backend's content generation advances only suggests the
+  // upload is redundant; equal payload bytes prove it.
+  std::unordered_map<uint64_t, uint64_t> promotion_texture_payload_hashes_;
+  uint64_t promotion_texture_payload_checked_ = 0;
+  uint64_t promotion_texture_payload_identical_ = 0;
+  uint64_t promotion_texture_payload_reported_ = 0;
+  size_t translated_generic_guarded_bytes_ = 0;
+  bool translated_generic_main_guard_enabled_ = false;
+  bool translated_generic_family_budget_logged_ = false;
+  std::atomic<uint64_t> translated_rectangle_guard_generation_{1};
+  std::atomic<bool> translated_rectangle_guard_active_{false};
+  std::atomic<uint64_t>
+      translated_rectangle_last_gpu_invalidation_generation_{0};
+  uint32_t translated_rectangle_guard_address_ = 0;
+  uint64_t translated_rectangle_snapshot_frame_ = 0;
+  uint32_t translated_rectangle_snapshot_address_ = 0;
+  std::array<uint8_t, 84> translated_rectangle_snapshot_bytes_{};
+  bool translated_rectangle_snapshot_valid_ = false;
+  uint32_t translated_rectangle_candidate_fetch_count_ = 0;
+  bool translated_rectangle_fetch_seen_ = false;
+  uint32_t translated_rectangle_fetch_index_ = 0;
+  uint32_t translated_rectangle_fetch_type_ = 0;
+  uint32_t translated_rectangle_fetch_size_bytes_ = 0;
+  uint32_t translated_rectangle_fetch_address_ = 0;
+  bool translated_rectangle_fetch_translate_valid_ = false;
+  bool translated_rectangle_stability_diagnostic_logged_ = false;
+  bool translated_ps328_guard_diagnostic_logged_ = false;
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;

@@ -694,7 +694,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 }
 
 bool TextureCache::DebugGetActiveTextureBinding(
-    uint32_t fetch_constant_index, DebugActiveTextureBinding& binding_out) const {
+    uint32_t fetch_constant_index, DebugActiveTextureBinding& binding_out,
+    bool signed_view) const {
   binding_out = {};
   if (fetch_constant_index >= texture_bindings_.size()) {
     return false;
@@ -715,10 +716,15 @@ bool TextureCache::DebugGetActiveTextureBinding(
   binding_out.format = uint32_t(key.format);
   binding_out.scaled_resolve = key.scaled_resolve != 0;
 
-  const Texture* texture = binding->texture ? binding->texture : binding->texture_signed;
+  const Texture* texture =
+      signed_view && binding->texture_signed != nullptr
+          ? binding->texture_signed
+          : (binding->texture ? binding->texture : binding->texture_signed);
   if (texture != nullptr) {
     binding_out.base_length = texture->GetGuestBaseSize();
     binding_out.mip_length = texture->GetGuestMipsSize();
+    binding_out.content_generation = texture->content_generation();
+    binding_out.outdated_mask = texture->outdated_mask();
   }
   return true;
 }
@@ -1258,6 +1264,7 @@ void TextureCache::Texture::MarkAsUsed() {
 void TextureCache::Texture::WatchCallback(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
     bool invalidated_by_gpu) {
+  content_generation_.fetch_add(1, std::memory_order_acq_rel);
   texture_cache().DebugLogTeamProfileBackgroundTextureCandidate(
       invalidated_by_gpu ? (is_mip ? "invalidate-gpu-mips" : "invalidate-gpu-base")
                          : (is_mip ? "invalidate-cpu-mips" : "invalidate-cpu-base"),

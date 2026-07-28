@@ -290,6 +290,60 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
   return reinterpret_cast<WatchHandle>(range);
 }
 
+bool SharedMemory::RequestRangeIfBytesEqual(uint32_t start, uint32_t length,
+                                            const uint8_t* expected) {
+  if (expected == nullptr || length == 0 || start >= kBufferSize ||
+      length > kBufferSize - start) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  const uint8_t* guest_bytes =
+      memory_.TranslatePhysical<const uint8_t*>(start);
+  if (guest_bytes == nullptr ||
+      std::memcmp(guest_bytes, expected, length) != 0) {
+    return false;
+  }
+  // RequestRange acquires the recursive global critical region internally.
+  // Keeping this outer lock prevents a CPU invalidation from racing the exact
+  // comparison and residency refresh.
+  if (!RequestRange(start, length)) {
+    return false;
+  }
+  guest_bytes = memory_.TranslatePhysical<const uint8_t*>(start);
+  return guest_bytes != nullptr &&
+         std::memcmp(guest_bytes, expected, length) == 0;
+}
+
+bool SharedMemory::GuestBytesEqual(uint32_t start, uint32_t length,
+                                   const uint8_t* expected) {
+  if (expected == nullptr || length == 0 || start >= kBufferSize ||
+      length > kBufferSize - start) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  const uint8_t* guest_bytes =
+      memory_.TranslatePhysical<const uint8_t*>(start);
+  return guest_bytes != nullptr &&
+         std::memcmp(guest_bytes, expected, length) == 0;
+}
+
+bool SharedMemory::CopyGuestBytes(uint32_t start, uint32_t length,
+                                  std::vector<uint8_t>& bytes_out) {
+  bytes_out.clear();
+  if (length == 0 || start >= kBufferSize ||
+      length > kBufferSize - start) {
+    return false;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  const uint8_t* guest_bytes =
+      memory_.TranslatePhysical<const uint8_t*>(start);
+  if (guest_bytes == nullptr) {
+    return false;
+  }
+  bytes_out.assign(guest_bytes, guest_bytes + length);
+  return true;
+}
+
 void SharedMemory::UnwatchMemoryRange(WatchHandle handle) {
   auto global_lock = global_critical_region_.Acquire();
   UnlinkWatchRange(reinterpret_cast<WatchRange*>(handle));

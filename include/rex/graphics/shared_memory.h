@@ -79,6 +79,19 @@ class SharedMemory {
   // the range has been fully updated and is usable.
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
+  // Under the shared-memory global critical region, verifies exact guest
+  // bytes, refreshes residency, then verifies once more before releasing the
+  // lock. Used by narrow deferred-replay guards where unrelated writes on the
+  // same host page must not invalidate an unchanged payload.
+  bool RequestRangeIfBytesEqual(uint32_t start, uint32_t length,
+                                const uint8_t* expected);
+  // Observer-only exact comparison against CPU guest physical memory. Unlike
+  // RequestRangeIfBytesEqual, this never allocates sparse GPU backing,
+  // uploads, inserts barriers, or ends a render pass.
+  bool GuestBytesEqual(uint32_t start, uint32_t length,
+                       const uint8_t* expected);
+  bool CopyGuestBytes(uint32_t start, uint32_t length,
+                      std::vector<uint8_t>& bytes_out);
 
   const uint8_t* DebugTranslatePhysical(uint32_t address) const {
     return memory_.TranslatePhysical<const uint8_t*>(address);
