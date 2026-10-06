@@ -29,6 +29,9 @@ class DeferredCommandBuffer {
                         size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
+  // Shrinks the render area of each dynamic rendering pass to what its draws
+  // and clears can touch. Called by Execute; idempotent.
+  void TightenRenderAreas();
   void Execute(VkCommandBuffer command_buffer);
   bool empty() const { return command_stream_.empty(); }
 

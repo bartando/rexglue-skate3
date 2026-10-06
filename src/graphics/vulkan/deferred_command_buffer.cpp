@@ -15,11 +15,18 @@
 #include <cstring>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/math.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_tight_render_area, true, "GPU/Vulkan",
+                    "Shrink each render pass's render area to the union of the scissors of its "
+                    "draws and its clear rectangles. Host render targets span the whole EDRAM "
+                    "pitch and height, and tile-based GPUs (MoltenVK sizes the Metal render "
+                    "target from the render area) load and store every tile of it per pass.");
 
 namespace rex::graphics::vulkan {
 
@@ -33,10 +40,116 @@ void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
 }
 
+void DeferredCommandBuffer::TightenRenderAreas() {
+  if (!REXCVAR_GET(vulkan_tight_render_area)) {
+    return;
+  }
+  struct Bounds {
+    uint32_t x0 = UINT32_MAX, y0 = UINT32_MAX, x1 = 0, y1 = 0;
+    void Add(const VkRect2D& rect) {
+      x0 = std::min(x0, uint32_t(rect.offset.x));
+      y0 = std::min(y0, uint32_t(rect.offset.y));
+      x1 = std::max(x1, uint32_t(rect.offset.x) + rect.extent.width);
+      y1 = std::max(y1, uint32_t(rect.offset.y) + rect.extent.height);
+    }
+  };
+  // Scissor state carries over between passes. Unknown until the first
+  // vkCmdSetScissor in this command buffer, and a draw under an unknown
+  // scissor could touch anything.
+  bool scissor_known = false;
+  VkRect2D scissor = {};
+  ArgsVkBeginRendering* pass = nullptr;
+  bool pass_tightenable = false;
+  Bounds bounds;
+  uintmax_t* stream = command_stream_.data();
+  size_t stream_remaining = command_stream_.size();
+  while (stream_remaining) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+    uintmax_t* args_ptr = stream + kCommandHeaderSizeElements;
+    switch (header.command) {
+      case Command::kVkBeginRendering: {
+        pass = reinterpret_cast<ArgsVkBeginRendering*>(args_ptr);
+        bounds = Bounds();
+        // A clear load op applies to the whole render area, so shrinking
+        // would leave the rest uncleared.
+        pass_tightenable = true;
+        const auto* attachments = reinterpret_cast<const VkRenderingAttachmentInfo*>(
+            reinterpret_cast<const uint8_t*>(args_ptr) +
+            rex::align(sizeof(ArgsVkBeginRendering), alignof(VkRenderingAttachmentInfo)));
+        uint32_t attachment_count = pass->color_attachment_count +
+                                    uint32_t(pass->has_depth_attachment) +
+                                    uint32_t(pass->has_stencil_attachment);
+        for (uint32_t i = 0; i < attachment_count; ++i) {
+          if (attachments[i].imageView != VK_NULL_HANDLE &&
+              (attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+               attachments[i].resolveMode != VK_RESOLVE_MODE_NONE)) {
+            pass_tightenable = false;
+          }
+        }
+      } break;
+      case Command::kVkSetScissor: {
+        const auto& args = *reinterpret_cast<const ArgsVkSetScissor*>(args_ptr);
+        if (args.first_scissor == 0 && args.scissor_count) {
+          scissor = *reinterpret_cast<const VkRect2D*>(
+              reinterpret_cast<const uint8_t*>(args_ptr) +
+              rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D)));
+          scissor_known = true;
+        }
+      } break;
+      case Command::kVkDraw:
+      case Command::kVkDrawIndexed:
+        if (pass) {
+          if (scissor_known) {
+            bounds.Add(scissor);
+          } else {
+            pass_tightenable = false;
+          }
+        }
+        break;
+      case Command::kVkClearAttachments:
+        if (pass) {
+          const auto& args = *reinterpret_cast<const ArgsVkClearAttachments*>(args_ptr);
+          size_t rects_offset =
+              rex::align(rex::align(sizeof(ArgsVkClearAttachments), alignof(VkClearAttachment)) +
+                             sizeof(VkClearAttachment) * args.attachment_count,
+                         alignof(VkClearRect));
+          const auto* rects = reinterpret_cast<const VkClearRect*>(
+              reinterpret_cast<const uint8_t*>(args_ptr) + rects_offset);
+          for (uint32_t i = 0; i < args.rect_count; ++i) {
+            bounds.Add(rects[i].rect);
+          }
+        }
+        break;
+      case Command::kVkEndRendering:
+        if (pass && pass_tightenable && bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0) {
+          VkRect2D& area = pass->render_area;
+          uint32_t x0 = std::max(bounds.x0, uint32_t(area.offset.x));
+          uint32_t y0 = std::max(bounds.y0, uint32_t(area.offset.y));
+          uint32_t x1 = std::min(bounds.x1, uint32_t(area.offset.x) + area.extent.width);
+          uint32_t y1 = std::min(bounds.y1, uint32_t(area.offset.y) + area.extent.height);
+          if (x1 > x0 && y1 > y0) {
+            area.offset.x = int32_t(x0);
+            area.offset.y = int32_t(y0);
+            area.extent.width = x1 - x0;
+            area.extent.height = y1 - y0;
+          }
+        }
+        pass = nullptr;
+        break;
+      default:
+        break;
+    }
+    stream += kCommandHeaderSizeElements + header.arguments_size_elements;
+    stream_remaining -= kCommandHeaderSizeElements + header.arguments_size_elements;
+  }
+}
+
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+
+  TightenRenderAreas();
 
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
