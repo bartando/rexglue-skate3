@@ -49,6 +49,8 @@ void SharedMemory::InitializeCommon() {
   valid_buffer_a_.assign(num_system_page_flags_, 0);
   valid_buffer_b_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  window_accessed_pages_.assign(num_system_page_flags_, 0);
+  window_accessed_any_ = false;
   active_valid_flags_.store(valid_buffer_a_.data(), std::memory_order_relaxed);
   staging_valid_flags_.store(valid_buffer_b_.data(), std::memory_order_relaxed);
   gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
@@ -443,6 +445,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   // Mark the range as valid (so pages are not reuploaded until modified by the
   // CPU) and watch it so the CPU can reuse it and this will be caught.
   MakeRangeValid(start, length, true);
+  NoteGpuAccess(start, length);
 }
 
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -519,12 +522,75 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
+void SharedMemory::NoteGpuAccess(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize || window_accessed_pages_.empty()) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t block = page_first >> 6; block <= page_last >> 6; ++block) {
+    uint64_t mask = ~uint64_t(0);
+    if (block == page_first >> 6) {
+      mask &= ~uint64_t(0) << (page_first & 63);
+    }
+    if (block == page_last >> 6) {
+      mask &= ~uint64_t(0) >> (63 - (page_last & 63));
+    }
+    window_accessed_pages_[block] |= mask;
+  }
+  window_accessed_any_ = true;
+}
+
+void SharedMemory::ResetGpuAccessWindow() {
+  if (window_accessed_any_) {
+    std::fill(window_accessed_pages_.begin(), window_accessed_pages_.end(), 0);
+    window_accessed_any_ = false;
+  }
+}
+
+bool SharedMemory::AnyPageAccessedInWindow(
+    const std::vector<std::pair<uint32_t, uint32_t>>& page_ranges) const {
+  if (!window_accessed_any_) {
+    return false;
+  }
+  for (const auto& range : page_ranges) {
+    if (!range.second) {
+      continue;
+    }
+    uint32_t page_first = range.first;
+    uint32_t page_last = range.first + range.second - 1;
+    for (uint32_t block = page_first >> 6; block <= page_last >> 6; ++block) {
+      uint64_t mask = ~uint64_t(0);
+      if (block == page_first >> 6) {
+        mask &= ~uint64_t(0) << (page_first & 63);
+      }
+      if (block == page_last >> 6) {
+        mask &= ~uint64_t(0) >> (63 - (page_last & 63));
+      }
+      if (window_accessed_pages_[block] & mask) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+  bool result = RequestRangesUntracked(ranges, count);
+  for (size_t i = 0; ranges && i < count; ++i) {
+    NoteGpuAccess(ranges[i].first, ranges[i].second);
+  }
+  return result;
+}
+
+bool SharedMemory::RequestRangesUntracked(const std::pair<uint32_t, uint32_t>* ranges,
+                                          size_t count) {
   if (ranges == nullptr || !count) {
     return true;
   }
   if (count == 1) {
-    return RequestRange(ranges[0].first, ranges[0].second);
+    return RequestRangeUntracked(ranges[0].first, ranges[0].second);
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
@@ -694,6 +760,12 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+  bool result = RequestRangeUntracked(start, length);
+  NoteGpuAccess(start, length);
+  return result;
+}
+
+bool SharedMemory::RequestRangeUntracked(uint32_t start, uint32_t length) {
   // Some texture or buffer is empty, for example - safe to draw in this case.
   if (!length) {
     return true;

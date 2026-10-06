@@ -30,6 +30,7 @@ class DeferredCommandBuffer {
 
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
+  bool empty() const { return command_stream_.empty(); }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,

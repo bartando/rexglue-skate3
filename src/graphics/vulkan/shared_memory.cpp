@@ -27,6 +27,11 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
+                    "Record shared memory uploads no earlier work in the submission "
+                    "depends on at the start of the submission, instead of ending the "
+                    "current render pass for them.");
+
 namespace rex::graphics::vulkan {
 
 VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
@@ -345,18 +350,26 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
-  // Attribute the GPU time of the upload copies (and the barriers around
-  // them) to the shared memory upload profiling bucket.
-  command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kSharedMemoryUpload);
-  // upload_page_ranges are sorted, use them to determine the range for the
-  // ordering barrier.
-  Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
-                         << page_size_log2()));
-  command_processor_.SubmitBarriers(true);
-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  const bool hoist = REXCVAR_GET(vulkan_hoist_shared_memory_uploads) &&
+                     !AnyPageAccessedInWindow(upload_page_ranges);
+  if (!hoist) {
+    // Attribute the GPU time of the upload copies (and the barriers around
+    // them) to the shared memory upload profiling bucket.
+    command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kSharedMemoryUpload);
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                        upload_page_ranges.front().first)
+                           << page_size_log2()));
+    command_processor_.SubmitBarriers(true);
+  }
+  // The prologue is fenced by full barriers when the submission ends, so
+  // hoisted copies need no usage transition here.
+  DeferredCommandBuffer& command_buffer =
+      hoist ? command_processor_.upload_prologue_command_buffer()
+            : command_processor_.deferred_command_buffer();
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
   upload_regions_.clear();

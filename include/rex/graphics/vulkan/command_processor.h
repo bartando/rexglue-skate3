@@ -208,6 +208,14 @@ class VulkanCommandProcessor : public CommandProcessor {
     return deferred_command_buffer_;
   }
 
+  // Transfers replayed at the start of the current submission, before any
+  // render pass, so uploads don't split passes. The recorder must guarantee
+  // nothing earlier in the submission depends on the old contents.
+  DeferredCommandBuffer& upload_prologue_command_buffer() {
+    assert_true(submission_open_);
+    return upload_prologue_command_buffer_;
+  }
+
   bool submission_open() const { return submission_open_; }
   uint64_t GetCurrentSubmission() const {
     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
@@ -653,6 +661,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<CommandBuffer> command_buffers_writable_;
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
+  DeferredCommandBuffer upload_prologue_command_buffer_;
 
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;

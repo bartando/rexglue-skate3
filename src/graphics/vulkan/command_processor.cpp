@@ -1036,6 +1036,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
                                                system::KernelState* kernel_state)
     : CommandProcessor(graphics_system, kernel_state),
       deferred_command_buffer_(*this),
+      upload_prologue_command_buffer_(*this),
       transient_descriptor_allocator_uniform_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -2616,6 +2617,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   sparse_memory_binds_.clear();
 
   deferred_command_buffer_.Reset();
+  upload_prologue_command_buffer_.Reset();
   for (const auto& command_buffer_pair : command_buffers_submitted_) {
     dfn.vkDestroyCommandPool(device, command_buffer_pair.second.pool, nullptr);
   }
@@ -7041,6 +7043,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
           }
         }
         if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
+          // Cached residency skips RequestRange, but the draw still reads it.
+          shared_memory_->NoteGpuAccess(vfetch_constant.address << 2, vfetch_constant.size << 2);
           continue;
         }
         switch (vfetch_constant.type) {
@@ -7064,6 +7068,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
         }
         VertexBufferState& state = vertex_buffer_states_[vfetch_index];
         if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+          shared_memory_->NoteGpuAccess(vfetch_constant.address << 2, vfetch_constant.size << 2);
           vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
           continue;
         }
@@ -10805,6 +10810,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     // the end of the submission (when async pipeline object creation requests
     // are fulfilled).
     deferred_command_buffer_.Reset();
+    upload_prologue_command_buffer_.Reset();
+    if (shared_memory_) {
+      shared_memory_->ResetGpuAccessWindow();
+    }
 
     // Reset cached state of the command buffer.
     dynamic_viewport_update_needed_ = true;
@@ -11175,6 +11184,24 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
           VK_SUCCESS) {
         REXGPU_ERROR("Failed to begin a Vulkan command buffer");
         return false;
+      }
+      if (!upload_prologue_command_buffer_.empty()) {
+        // The prologue's copies overwrite pages that earlier submissions may
+        // still be reading, and everything after must see the new contents.
+        VkMemoryBarrier memory_barrier;
+        memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        memory_barrier.pNext = nullptr;
+        memory_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        dfn.vkCmdPipelineBarrier(command_buffer.buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memory_barrier, 0,
+                                 nullptr, 0, nullptr);
+        upload_prologue_command_buffer_.Execute(command_buffer.buffer);
+        memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        memory_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        dfn.vkCmdPipelineBarrier(command_buffer.buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory_barrier, 0,
+                                 nullptr, 0, nullptr);
       }
       deferred_command_buffer_.Execute(command_buffer.buffer);
       if (is_closing_frame) {

@@ -113,7 +113,18 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // Records that GPU work in the current submission reads or writes the range.
+  // Requests and GPU writes are recorded automatically; callers that read the
+  // buffer without requesting (cached residency) must note the access
+  // themselves. A backend may only move an upload ahead of earlier work in the
+  // submission if none of that work touched the uploaded pages.
+  void NoteGpuAccess(uint32_t start, uint32_t length);
+  void ResetGpuAccessWindow();
+
  protected:
+  bool AnyPageAccessedInWindow(
+      const std::vector<std::pair<uint32_t, uint32_t>>& page_ranges) const;
+
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
   void InitializeCommon();
@@ -181,6 +192,11 @@ class SharedMemory {
   uint32_t page_size_log2_;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
+  bool RequestRangeUntracked(uint32_t start, uint32_t length);
+  bool RequestRangesUntracked(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+
+  std::vector<uint64_t> window_accessed_pages_;
+  bool window_accessed_any_ = false;
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;
