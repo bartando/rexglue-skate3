@@ -78,6 +78,12 @@ class VulkanSharedMemory : public SharedMemory {
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
+  struct StagedCopy {
+    VkBuffer buffer;
+    VkBufferCopy region;
+  };
+  std::vector<StagedCopy> staged_copies_;
+  std::vector<std::pair<uint32_t, const uint8_t*>> staged_pages_;
 
   // Created temporarily, only for downloading.
   VkBuffer trace_download_buffer_ = VK_NULL_HANDLE;

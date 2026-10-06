@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -129,8 +130,18 @@ class SharedMemory {
   void ResetGpuAccessWindow();
 
  protected:
-  bool AnyPageAccessedInWindow(
-      const std::vector<std::pair<uint32_t, uint32_t>>& page_ranges) const;
+  // Whether moving an upload ahead of earlier work in the window could change
+  // what that work read. new_pages are (page, staged contents) pairs. A page
+  // touched earlier is only safe if its previous contents are known, it wasn't
+  // uploaded in order earlier in the window, and the bytes the earlier work
+  // accessed are identical.
+  bool UploadChangesAccessedBytes(
+      const std::vector<std::pair<uint32_t, const uint8_t*>>& new_pages) const;
+  // Records the new contents of uploaded pages. Pages uploaded in order rather
+  // than hoisted can't be hoisted again in the window, since a later hoisted
+  // copy would land before them.
+  void NoteUploadedPages(const std::vector<std::pair<uint32_t, const uint8_t*>>& pages,
+                         bool hoisted);
 
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
@@ -206,7 +217,22 @@ class SharedMemory {
   bool RequestRangesUntracked(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
 
   std::vector<uint64_t> window_accessed_pages_;
+  // Accessed pages are either fully accessed or have sorted, disjoint
+  // [first, end) intervals of accessed byte offsets. Gaps matter: guest
+  // resource headers the CPU keeps updating often share pages with the data.
+  std::vector<uint64_t> window_fully_accessed_pages_;
+  std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>
+      window_partial_page_access_;
+  std::vector<uint64_t> window_inline_uploaded_pages_;
   bool window_accessed_any_ = false;
+  bool window_inline_uploaded_any_ = false;
+  void NotePartialPageAccess(uint32_t page, uint32_t offset_first, uint32_t offset_end);
+  // CPU copy of what the last upload of each page put in the buffer, valid
+  // until the GPU writes the page. Reserved lazily for the whole buffer; only
+  // uploaded pages get backed.
+  uint8_t* upload_shadow_ = nullptr;
+  bool upload_shadow_unavailable_ = false;
+  std::vector<uint64_t> upload_shadow_valid_;
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;

@@ -350,30 +350,12 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
-  const bool hoist = REXCVAR_GET(vulkan_hoist_shared_memory_uploads) &&
-                     !AnyPageAccessedInWindow(upload_page_ranges);
-  if (!hoist) {
-    // Attribute the GPU time of the upload copies (and the barriers around
-    // them) to the shared memory upload profiling bucket.
-    command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kSharedMemoryUpload);
-    // upload_page_ranges are sorted, use them to determine the range for the
-    // ordering barrier.
-    Use(Usage::kTransferDestination,
-        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                        upload_page_ranges.front().first)
-                           << page_size_log2()));
-    command_processor_.SubmitBarriers(true);
-  }
-  // The prologue is fenced by full barriers when the submission ends, so
-  // hoisted copies need no usage transition here.
-  DeferredCommandBuffer& command_buffer =
-      hoist ? command_processor_.upload_prologue_command_buffer()
-            : command_processor_.deferred_command_buffer();
+  // Staging first, since whether the copies may be hoisted depends on what was
+  // staged.
   uint64_t submission_current = command_processor_.GetCurrentSubmission();
   bool successful = true;
-  upload_regions_.clear();
-  VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
+  staged_copies_.clear();
+  staged_pages_.clear();
   for (auto upload_range : upload_page_ranges) {
     uint32_t upload_range_start = upload_range.first;
     uint32_t upload_range_length = upload_range.second;
@@ -394,18 +376,15 @@ bool VulkanSharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
-      if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
-        assert_true(upload_buffer_previous != VK_NULL_HANDLE);
-        command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
-                                       uint32_t(upload_regions_.size()), upload_regions_.data());
-        upload_regions_.clear();
-      }
-      upload_buffer_previous = upload_buffer;
-      VkBufferCopy& upload_region = upload_regions_.emplace_back();
-      upload_region.srcOffset = upload_buffer_offset;
-      upload_region.dstOffset = VkDeviceSize(upload_range_start << page_size_log2());
-      upload_region.size = upload_buffer_size;
+      staged_copies_.push_back(
+          {upload_buffer,
+           {upload_buffer_offset, VkDeviceSize(upload_range_start << page_size_log2()),
+            upload_buffer_size}});
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
+      for (uint32_t i = 0; i < upload_buffer_pages; ++i) {
+        staged_pages_.emplace_back(upload_range_start + i,
+                                   upload_buffer_mapping + (size_t(i) << page_size_log2()));
+      }
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
     }
@@ -413,11 +392,39 @@ bool VulkanSharedMemory::UploadRanges(
       break;
     }
   }
-  if (!upload_regions_.empty()) {
-    assert_true(upload_buffer_previous != VK_NULL_HANDLE);
-    command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
-                                   uint32_t(upload_regions_.size()), upload_regions_.data());
+  if (staged_copies_.empty()) {
+    return successful;
+  }
+
+  const bool hoist = REXCVAR_GET(vulkan_hoist_shared_memory_uploads) &&
+                     !UploadChangesAccessedBytes(staged_pages_);
+  NoteUploadedPages(staged_pages_, hoist);
+  if (!hoist) {
+    // Attribute the GPU time of the upload copies (and the barriers around
+    // them) to the shared memory upload profiling bucket.
+    command_processor_.BeginGpuTimestampedRegion(rex::perf::DrawBucket::kSharedMemoryUpload);
+    // upload_page_ranges are sorted, use them to determine the range for the
+    // ordering barrier.
+    Use(Usage::kTransferDestination,
+        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
+                        upload_page_ranges.front().first)
+                           << page_size_log2()));
+    command_processor_.SubmitBarriers(true);
+  }
+  // The prologue is fenced by full barriers when the submission ends, so
+  // hoisted copies need no usage transition here.
+  DeferredCommandBuffer& command_buffer =
+      hoist ? command_processor_.upload_prologue_command_buffer()
+            : command_processor_.deferred_command_buffer();
+  for (size_t i = 0; i < staged_copies_.size();) {
+    VkBuffer upload_buffer = staged_copies_[i].buffer;
     upload_regions_.clear();
+    for (; i < staged_copies_.size() && staged_copies_[i].buffer == upload_buffer; ++i) {
+      upload_regions_.push_back(staged_copies_[i].region);
+    }
+    command_buffer.CmdVkCopyBuffer(upload_buffer, buffer_, uint32_t(upload_regions_.size()),
+                                   upload_regions_.data());
   }
   return successful;
 }

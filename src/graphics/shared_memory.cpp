@@ -66,7 +66,11 @@ void SharedMemory::InitializeCommon() {
   valid_buffer_b_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
   window_accessed_pages_.assign(num_system_page_flags_, 0);
+  window_fully_accessed_pages_.assign(num_system_page_flags_, 0);
+  window_inline_uploaded_pages_.assign(num_system_page_flags_, 0);
+  upload_shadow_valid_.assign(num_system_page_flags_, 0);
   window_accessed_any_ = false;
+  window_inline_uploaded_any_ = false;
   active_valid_flags_.store(valid_buffer_a_.data(), std::memory_order_relaxed);
   staging_valid_flags_.store(valid_buffer_b_.data(), std::memory_order_relaxed);
   gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
@@ -86,6 +90,10 @@ void SharedMemory::InitializeSparseHostGpuMemory(uint32_t granularity_log2) {
 
 void SharedMemory::ShutdownCommon() {
   ReleaseTraceDownloadRanges();
+  if (upload_shadow_) {
+    memory::DeallocFixed(upload_shadow_, 0, memory::DeallocationType::kRelease);
+    upload_shadow_ = nullptr;
+  }
 
   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, false);
   assert_true(global_watches_.empty());
@@ -451,6 +459,38 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
   }
 }
 
+namespace {
+void SetPageBits(std::vector<uint64_t>& bits, uint32_t page_first, uint32_t page_last) {
+  for (uint32_t block = page_first >> 6; block <= page_last >> 6; ++block) {
+    uint64_t mask = ~uint64_t(0);
+    if (block == page_first >> 6) {
+      mask &= ~uint64_t(0) << (page_first & 63);
+    }
+    if (block == page_last >> 6) {
+      mask &= ~uint64_t(0) >> (63 - (page_last & 63));
+    }
+    bits[block] |= mask;
+  }
+}
+
+void ClearPageBits(std::vector<uint64_t>& bits, uint32_t page_first, uint32_t page_last) {
+  for (uint32_t block = page_first >> 6; block <= page_last >> 6; ++block) {
+    uint64_t mask = ~uint64_t(0);
+    if (block == page_first >> 6) {
+      mask &= ~uint64_t(0) << (page_first & 63);
+    }
+    if (block == page_last >> 6) {
+      mask &= ~uint64_t(0) >> (63 - (page_last & 63));
+    }
+    bits[block] &= ~mask;
+  }
+}
+
+bool PageBit(const std::vector<uint64_t>& bits, uint32_t page) {
+  return (bits[page >> 6] >> (page & 63)) & 1;
+}
+}  // namespace
+
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;
@@ -468,6 +508,7 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   // CPU) and watch it so the CPU can reuse it and this will be caught.
   MakeRangeValid(start, length, true);
   NoteGpuAccess(start, length);
+  ClearPageBits(upload_shadow_valid_, page_first, page_last);
 }
 
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
@@ -544,58 +585,142 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
+
 void SharedMemory::NoteGpuAccess(uint32_t start, uint32_t length) {
   if (!length || start >= kBufferSize || window_accessed_pages_.empty()) {
     return;
   }
   length = std::min(length, kBufferSize - start);
-  uint32_t page_first = start >> page_size_log2_;
-  uint32_t page_last = (start + length - 1) >> page_size_log2_;
-  for (uint32_t block = page_first >> 6; block <= page_last >> 6; ++block) {
-    uint64_t mask = ~uint64_t(0);
-    if (block == page_first >> 6) {
-      mask &= ~uint64_t(0) << (page_first & 63);
-    }
-    if (block == page_last >> 6) {
-      mask &= ~uint64_t(0) >> (63 - (page_last & 63));
-    }
-    window_accessed_pages_[block] |= mask;
-  }
+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
+  const uint32_t end = start + length;
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (end - 1) >> page_size_log2_;
+  SetPageBits(window_accessed_pages_, page_first, page_last);
   window_accessed_any_ = true;
+
+  const uint32_t offset_first = start & (page_size - 1);
+  const uint32_t offset_end = end - (page_last << page_size_log2_);
+  uint32_t full_first = page_first;
+  uint32_t full_last = page_last;
+  if (page_first == page_last) {
+    if (offset_first || offset_end != page_size) {
+      NotePartialPageAccess(page_first, offset_first, offset_end);
+      return;
+    }
+  } else {
+    if (offset_first) {
+      NotePartialPageAccess(page_first, offset_first, page_size);
+      ++full_first;
+    }
+    if (offset_end != page_size) {
+      NotePartialPageAccess(page_last, 0, offset_end);
+      --full_last;
+    }
+  }
+  if (full_first <= full_last) {
+    SetPageBits(window_fully_accessed_pages_, full_first, full_last);
+  }
+}
+
+void SharedMemory::NotePartialPageAccess(uint32_t page, uint32_t offset_first,
+                                         uint32_t offset_end) {
+  // Bounds the cost per page; collapsing to the hull is conservative.
+  constexpr size_t kMaxIntervals = 16;
+  auto& intervals = window_partial_page_access_[page];
+  auto it = std::lower_bound(intervals.begin(), intervals.end(), offset_first,
+                             [](const auto& interval, uint32_t offset) {
+                               return interval.second < offset;
+                             });
+  auto merge_end = it;
+  while (merge_end != intervals.end() && merge_end->first <= offset_end) {
+    offset_first = std::min(offset_first, merge_end->first);
+    offset_end = std::max(offset_end, merge_end->second);
+    ++merge_end;
+  }
+  it = intervals.erase(it, merge_end);
+  intervals.emplace(it, offset_first, offset_end);
+  if (intervals.size() > kMaxIntervals) {
+    intervals = {{intervals.front().first, intervals.back().second}};
+  }
 }
 
 void SharedMemory::ResetGpuAccessWindow() {
   if (window_accessed_any_) {
     std::fill(window_accessed_pages_.begin(), window_accessed_pages_.end(), 0);
+    std::fill(window_fully_accessed_pages_.begin(), window_fully_accessed_pages_.end(), 0);
+    window_partial_page_access_.clear();
     window_accessed_any_ = false;
+  }
+  if (window_inline_uploaded_any_) {
+    std::fill(window_inline_uploaded_pages_.begin(), window_inline_uploaded_pages_.end(), 0);
+    window_inline_uploaded_any_ = false;
   }
 }
 
-bool SharedMemory::AnyPageAccessedInWindow(
-    const std::vector<std::pair<uint32_t, uint32_t>>& page_ranges) const {
+bool SharedMemory::UploadChangesAccessedBytes(
+    const std::vector<std::pair<uint32_t, const uint8_t*>>& new_pages) const {
   if (!window_accessed_any_) {
     return false;
   }
-  for (const auto& range : page_ranges) {
-    if (!range.second) {
+  for (const auto& [page, data] : new_pages) {
+    if (!PageBit(window_accessed_pages_, page)) {
       continue;
     }
-    uint32_t page_first = range.first;
-    uint32_t page_last = range.first + range.second - 1;
-    for (uint32_t block = page_first >> 6; block <= page_last >> 6; ++block) {
-      uint64_t mask = ~uint64_t(0);
-      if (block == page_first >> 6) {
-        mask &= ~uint64_t(0) << (page_first & 63);
+    if (PageBit(window_inline_uploaded_pages_, page)) {
+      return true;
+    }
+    if (!upload_shadow_ || !PageBit(upload_shadow_valid_, page)) {
+      return true;
+    }
+    const uint8_t* shadow = upload_shadow_ + (size_t(page) << page_size_log2_);
+    auto bytes_changed = [&](uint32_t offset_first, uint32_t offset_end) {
+      return std::memcmp(shadow + offset_first, data + offset_first,
+                         offset_end - offset_first) != 0;
+    };
+    bool changed = false;
+    if (PageBit(window_fully_accessed_pages_, page)) {
+      changed = bytes_changed(0, uint32_t(1) << page_size_log2_);
+    } else if (auto partial = window_partial_page_access_.find(page);
+               partial != window_partial_page_access_.end()) {
+      for (const auto& [offset_first, offset_end] : partial->second) {
+        if (bytes_changed(offset_first, offset_end)) {
+          changed = true;
+          break;
+        }
       }
-      if (block == page_last >> 6) {
-        mask &= ~uint64_t(0) >> (63 - (page_last & 63));
-      }
-      if (window_accessed_pages_[block] & mask) {
-        return true;
-      }
+    } else {
+      changed = bytes_changed(0, uint32_t(1) << page_size_log2_);
+    }
+    if (changed) {
+      return true;
     }
   }
   return false;
+}
+
+void SharedMemory::NoteUploadedPages(
+    const std::vector<std::pair<uint32_t, const uint8_t*>>& pages, bool hoisted) {
+  if (!upload_shadow_ && !upload_shadow_unavailable_) {
+    upload_shadow_ = static_cast<uint8_t*>(memory::AllocFixed(
+        nullptr, kBufferSize, memory::AllocationType::kReserveCommit,
+        memory::PageAccess::kReadWrite));
+    if (!upload_shadow_) {
+      upload_shadow_unavailable_ = true;
+      REXGPU_WARN("Shared memory: Failed to reserve the upload shadow, uploads to pages "
+                  "accessed earlier in a submission won't be hoisted");
+    }
+  }
+  const size_t page_size = size_t(1) << page_size_log2_;
+  for (const auto& [page, data] : pages) {
+    if (upload_shadow_) {
+      std::memcpy(upload_shadow_ + (size_t(page) << page_size_log2_), data, page_size);
+      upload_shadow_valid_[page >> 6] |= uint64_t(1) << (page & 63);
+    }
+    if (!hoisted) {
+      window_inline_uploaded_pages_[page >> 6] |= uint64_t(1) << (page & 63);
+      window_inline_uploaded_any_ = true;
+    }
+  }
 }
 
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
