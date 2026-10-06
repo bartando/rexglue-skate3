@@ -57,6 +57,10 @@ REXCVAR_DEFINE_INT32(
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_host_alpha_to_coverage, true, "GPU/Vulkan",
+                    "Use the host's alpha to coverage instead of emulating the guest dithering "
+                    "pattern with a shader sample mask output, which is very slow on Metal")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1049,6 +1053,11 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
   return modification;
 }
 
+bool VulkanPipelineCache::UseHostAlphaToCoverage() const {
+  return REXCVAR_GET(vulkan_host_alpha_to_coverage) &&
+         render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+}
+
 SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderModification(
     const Shader& shader, uint32_t interpolator_mask, uint32_t param_gen_pos,
     reg::RB_DEPTHCONTROL normalized_depth_control) const {
@@ -1077,6 +1086,10 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     modification.pixel.param_gen_interpolator = 0;
     modification.pixel.param_gen_point = 0;
   }
+
+  modification.pixel.alpha_to_coverage =
+      uint32_t(shader.writes_color_target(0) &&
+               regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable && !UseHostAlphaToCoverage());
 
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
     using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
@@ -1508,6 +1521,9 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
         (pixel_shader_modification.pixel.depth_stencil_mode ==
              DepthStencilMode::kFloat24Truncating ||
          pixel_shader_modification.pixel.depth_stencil_mode == DepthStencilMode::kFloat24Rounding);
+    description_out.alpha_to_coverage =
+        uint32_t(UseHostAlphaToCoverage() && pixel_shader->shader().writes_color_target(0) &&
+                 regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable);
   }
   description_out.render_pass_key = render_pass_key;
 
@@ -3420,6 +3436,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
     multisample_state.rasterizationSamples =
         VkSampleCountFlagBits(uint32_t(1) << uint32_t(description.render_pass_key.msaa_samples));
   }
+  multisample_state.alphaToCoverageEnable = description.alpha_to_coverage ? VK_TRUE : VK_FALSE;
   if (description.sample_rate_shading &&
       multisample_state.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT) {
     multisample_state.sampleShadingEnable = VK_TRUE;

@@ -2912,7 +2912,9 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
       float24_depth_conversion && !current_shader().writes_depth();
   bool alpha_to_coverage_possible = !is_depth_only_fragment_shader_ &&
                                     current_shader().writes_color_target(0) &&
-                                    !IsExecutionModeEarlyFragmentTests();
+                                    !IsExecutionModeEarlyFragmentTests() &&
+                                    (edram_fragment_shader_interlock_ ||
+                                     GetSpirvShaderModification().pixel.alpha_to_coverage);
 
   // Fragment coordinates.
   // TODO(Triang3l): More conditions - alpha to coverage (if RT 0 is written,
