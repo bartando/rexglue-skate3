@@ -119,6 +119,13 @@ class SharedMemory {
   // themselves. A backend may only move an upload ahead of earlier work in the
   // submission if none of that work touched the uploaded pages.
   void NoteGpuAccess(uint32_t start, uint32_t length);
+
+  uint32_t page_size_log2() const { return page_size_log2_; }
+  // Inclusive address range whose watches are being fired. Only meaningful
+  // inside a watch callback.
+  uint32_t firing_address_first() const { return firing_address_first_; }
+  uint32_t firing_address_last() const { return firing_address_last_; }
+  const uint8_t* TranslatePhysical(uint32_t address) const;
   void ResetGpuAccessWindow();
 
  protected:
@@ -141,7 +148,7 @@ class SharedMemory {
 
   memory::Memory& memory() const { return memory_; }
 
-  uint32_t page_size_log2() const { return page_size_log2_; }
+
 
   uint32_t host_gpu_memory_sparse_granularity_log2() const {
     return host_gpu_memory_sparse_granularity_log2_;
@@ -190,6 +197,9 @@ class SharedMemory {
   // on it is not hard - the access callback takes a range as an argument, and
   // touched pages of the buffer of this size will be invalidated).
   uint32_t page_size_log2_;
+  uint32_t cpu_invalidation_widen_pages_ = 64;
+  uint32_t firing_address_first_ = 0;
+  uint32_t firing_address_last_ = 0;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
   bool RequestRangeUntracked(uint32_t start, uint32_t length);

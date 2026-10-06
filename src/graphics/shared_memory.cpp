@@ -34,6 +34,15 @@ REXCVAR_DEFINE_BOOL(
     "a host page with it and does not intersect its exact byte range.")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(
+    shared_memory_cpu_invalidation_widen_kb, 16, "GPU",
+    "How far a CPU write fault widens shared memory invalidation, in KB "
+    "(rounded to a power-of-two number of host pages, at most 64). Wider means "
+    "fewer access violations but more re-uploads of unchanged neighbours. "
+    "Upstream used 64 host pages, which is 256 KB on 4 KB pages but 1 MB on "
+    "Apple Silicon's 16 KB pages.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics {
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
@@ -46,6 +55,13 @@ SharedMemory::~SharedMemory() {
 
 void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
+  {
+    uint32_t widen_pages =
+        uint32_t(std::max(REXCVAR_GET(shared_memory_cpu_invalidation_widen_kb), int32_t(1))) *
+        1024 >> page_size_log2_;
+    widen_pages = std::clamp(widen_pages, uint32_t(1), uint32_t(64));
+    cpu_invalidation_widen_pages_ = uint32_t(1) << rex::log2_floor(widen_pages);
+  }
   valid_buffer_a_.assign(num_system_page_flags_, 0);
   valid_buffer_b_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
@@ -346,6 +362,10 @@ bool SharedMemory::CopyGuestBytes(uint32_t start, uint32_t length,
   return true;
 }
 
+const uint8_t* SharedMemory::TranslatePhysical(uint32_t address) const {
+  return memory_.TranslatePhysical<const uint8_t*>(address);
+}
+
 void SharedMemory::UnwatchMemoryRange(WatchHandle handle) {
   auto global_lock = global_critical_region_.Acquire();
   UnlinkWatchRange(reinterpret_cast<WatchRange*>(handle));
@@ -368,6 +388,8 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
       exact_gpu_watch_diagnostic || filter_gpu_page_only_watches;
 
   auto global_lock = global_critical_region_.Acquire();
+  firing_address_first_ = address_first;
+  firing_address_last_ = address_last;
 
   // Fire global watches.
   for (const auto global_watch : global_watches_) {
@@ -901,22 +923,29 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   auto global_lock = global_critical_region_.Acquire();
 
   if (!exact_range) {
-    // Check if a somewhat wider range (up to 64 host pages) can be
-    // invalidated - if no GPU-written data nearby that was not intended to be
+    // Check if a somewhat wider range (up to the configured widening window) can be
+    // invalidated (up to the configured widening window) - if no GPU-written data nearby that was not intended to be
     // invalidated since it's not in sync with CPU memory and can't be
     // reuploaded. It's a lot cheaper to upload some excess data than to catch
     // access violations - with 4 KB callbacks, 58410824 (being a
     // software-rendered game) runs at 4 FPS on Intel Core i7-3770, with 64 KB,
     // the CPU game code takes 3 ms to run per frame, but with 256 KB, it's 0.7
     // ms.
-    if (page_first & 63) {
+    const uint32_t widen_mask = cpu_invalidation_widen_pages_ - 1;
+    if (page_first & widen_mask) {
       uint64_t gpu_written_start = system_page_flags_valid_and_gpu_written_[block_first];
       gpu_written_start &= (uint64_t(1) << (page_first & 63)) - 1;
+      // Pages before the widening window act as a barrier, like GPU-written ones.
+      gpu_written_start |= (uint64_t(1) << (page_first & 63 & ~widen_mask)) - 1;
       page_first = (page_first & ~uint32_t(63)) + (64 - rex::lzcnt(gpu_written_start));
     }
-    if ((page_last & 63) != 63) {
+    if ((page_last & widen_mask) != widen_mask) {
       uint64_t gpu_written_end = system_page_flags_valid_and_gpu_written_[block_last];
       gpu_written_end &= ~((uint64_t(1) << ((page_last & 63) + 1)) - 1);
+      uint32_t window_last = (page_last | widen_mask) & 63;
+      if (window_last != 63) {
+        gpu_written_end |= ~((uint64_t(1) << (window_last + 1)) - 1);
+      }
       page_last =
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
     }

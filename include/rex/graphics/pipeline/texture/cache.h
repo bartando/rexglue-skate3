@@ -270,6 +270,11 @@ class TextureCache {
       return mips_outdated_;
     }
     void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
+    // Re-arms the watch of an outdated base (0) or mips (1) range without a
+    // reload if only shared edge pages were invalidated and the texture's
+    // bytes in them are unchanged.
+    bool TryRevalidateEdgePages(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                uint32_t slot);
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
                        bool invalidated_by_gpu);
@@ -321,6 +326,24 @@ class TextureCache {
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+
+    // Host pages only partially covered by a watched range can also hold
+    // unrelated guest data (common with 16 KB host pages). CPU writes there
+    // invalidate the texture without changing it, so the texture's bytes in
+    // those pages are hashed when watching and compared before reloading.
+    struct EdgePages {
+      uint32_t start[2];
+      uint32_t length[2];
+      uint64_t hash[2];
+      uint32_t count = 0;
+      // Set when the last invalidation touched nothing but these pages.
+      bool suspect = false;
+    };
+    EdgePages edge_pages_[2];
+
+    void Watch(uint32_t slot);
+    void CaptureEdgePages(uint32_t slot, uint32_t start, uint32_t length);
+    bool OnlyEdgePagesFiring(uint32_t slot, uint32_t start, uint32_t length) const;
   };
 
   // Rules of data access in load shaders:

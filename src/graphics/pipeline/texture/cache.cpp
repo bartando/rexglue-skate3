@@ -30,6 +30,11 @@
 #include <rex/perf/counter.h>
 #include <rex/system/xmemory.h>
 
+REXCVAR_DEFINE_BOOL(texture_cache_verify_shared_edge_pages, true, "GPU",
+                    "Skip reloading a texture when a CPU write only hit host pages it shares "
+                    "with other data and its own bytes there are unchanged.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 128, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
@@ -407,10 +412,12 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   {
     auto global_lock = global_critical_region_.Acquire();
     if (outdated_mask & Texture::kOutdatedBitBase) {
-      base_outdated = texture.base_outdated(global_lock);
+      base_outdated = texture.base_outdated(global_lock) &&
+                      !texture.TryRevalidateEdgePages(global_lock, 0);
     }
     if (outdated_mask & Texture::kOutdatedBitMips) {
-      mips_outdated = texture.mips_outdated(global_lock);
+      mips_outdated = texture.mips_outdated(global_lock) &&
+                      !texture.TryRevalidateEdgePages(global_lock, 1);
     }
   }
   if (!base_outdated && !mips_outdated) {
@@ -1216,22 +1223,103 @@ TextureCache::Texture::~Texture() {
 }
 
 void TextureCache::Texture::MakeUpToDateAndWatch(
-    const std::unique_lock<std::recursive_mutex>& global_lock) {
-  SharedMemory& shared_memory = texture_cache().shared_memory();
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock) {
   if (base_outdated_) {
-    assert_not_zero(GetGuestBaseSize());
-    base_outdated_ = false;
-    base_watch_handle_ = shared_memory.WatchMemoryRange(
-        key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
-    outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+    Watch(0);
   }
   if (mips_outdated_) {
-    assert_not_zero(GetGuestMipsSize());
-    mips_outdated_ = false;
-    mips_watch_handle_ = shared_memory.WatchMemoryRange(
-        key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
-    outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
+    Watch(1);
   }
+}
+
+void TextureCache::Texture::Watch(uint32_t slot) {
+  const uint32_t start = (slot ? key().mip_page : key().base_page) << 12;
+  const uint32_t length = slot ? GetGuestMipsSize() : GetGuestBaseSize();
+  assert_not_zero(length);
+  (slot ? mips_outdated_ : base_outdated_) = false;
+  (slot ? mips_watch_handle_ : base_watch_handle_) = texture_cache().shared_memory().WatchMemoryRange(
+      start, length, TextureCache::WatchCallback, this, nullptr, slot);
+  outdated_mask_.fetch_and(~(slot ? kOutdatedBitMips : kOutdatedBitBase),
+                           std::memory_order_release);
+  CaptureEdgePages(slot, start, length);
+}
+
+void TextureCache::Texture::CaptureEdgePages(uint32_t slot, uint32_t start, uint32_t length) {
+  EdgePages& edges = edge_pages_[slot];
+  edges.count = 0;
+  edges.suspect = false;
+  if (!REXCVAR_GET(texture_cache_verify_shared_edge_pages)) {
+    return;
+  }
+  const SharedMemory& shared_memory = texture_cache().shared_memory();
+  const uint32_t page_mask = (uint32_t(1) << shared_memory.page_size_log2()) - 1;
+  const uint32_t end = start + length;
+  const uint32_t first_page_end = (start | page_mask) + 1;
+  auto add = [&](uint32_t edge_start, uint32_t edge_end) {
+    edges.start[edges.count] = edge_start;
+    edges.length[edges.count] = edge_end - edge_start;
+    edges.hash[edges.count] = XXH3_64bits(
+        shared_memory.TranslatePhysical(edge_start), edge_end - edge_start);
+    ++edges.count;
+  };
+  if ((start & page_mask) || end < first_page_end) {
+    add(start, std::min(end, first_page_end));
+  }
+  const uint32_t last_page_start = (end - 1) & ~page_mask;
+  if ((end & page_mask) && last_page_start >= first_page_end) {
+    add(last_page_start, end);
+  }
+}
+
+bool TextureCache::Texture::OnlyEdgePagesFiring(uint32_t slot, uint32_t start,
+                                                uint32_t length) const {
+  const EdgePages& edges = edge_pages_[slot];
+  if (!edges.count) {
+    return false;
+  }
+  const SharedMemory& shared_memory = texture_cache().shared_memory();
+  const uint32_t page_size_log2 = shared_memory.page_size_log2();
+  const uint32_t first = std::max(shared_memory.firing_address_first(), start);
+  const uint32_t last = std::min(shared_memory.firing_address_last(), start + length - 1);
+  if (first > last) {
+    return false;
+  }
+  for (uint32_t page = first >> page_size_log2; page <= last >> page_size_log2; ++page) {
+    bool is_edge = false;
+    for (uint32_t i = 0; i < edges.count; ++i) {
+      is_edge |= (edges.start[i] >> page_size_log2) == page;
+    }
+    if (!is_edge) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TextureCache::Texture::TryRevalidateEdgePages(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t slot) {
+  EdgePages& edges = edge_pages_[slot];
+  if (!(slot ? mips_outdated_ : base_outdated_) || !edges.suspect) {
+    return false;
+  }
+  edges.suspect = false;
+  // Requesting re-protects the pages. The global lock is held from here until
+  // the watch is re-armed, so a concurrent write either lands before the hash
+  // or blocks in the fault handler and fires the new watch.
+  SharedMemory& shared_memory = texture_cache().shared_memory();
+  for (uint32_t i = 0; i < edges.count; ++i) {
+    if (!shared_memory.RequestRange(edges.start[i], edges.length[i])) {
+      return false;
+    }
+  }
+  for (uint32_t i = 0; i < edges.count; ++i) {
+    if (XXH3_64bits(shared_memory.TranslatePhysical(edges.start[i]),
+                    edges.length[i]) != edges.hash[i]) {
+      return false;
+    }
+  }
+  Watch(slot);
+  return true;
 }
 
 void TextureCache::Texture::MarkAsUsed() {
@@ -1269,6 +1357,11 @@ void TextureCache::Texture::WatchCallback(
       invalidated_by_gpu ? (is_mip ? "invalidate-gpu-mips" : "invalidate-gpu-base")
                          : (is_mip ? "invalidate-cpu-mips" : "invalidate-cpu-base"),
       UINT32_MAX, *this);
+  const uint32_t slot = is_mip ? 1 : 0;
+  edge_pages_[slot].suspect =
+      !invalidated_by_gpu &&
+      OnlyEdgePagesFiring(slot, (is_mip ? key().mip_page : key().base_page) << 12,
+                          is_mip ? GetGuestMipsSize() : GetGuestBaseSize());
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
