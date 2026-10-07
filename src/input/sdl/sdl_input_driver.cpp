@@ -57,6 +57,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       // Match Xenia's SDL setup: keep SDL from calling timeBeginPeriod(1) and
       // weakening the process-wide NT timer resolution requested on startup.
       SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "0", SDL_HINT_OVERRIDE);
+      // SDL drops all controller events while its window is unfocused, which
+      // silently kills the pad as soon as another app (e.g. on a second
+      // screen) takes focus. Keyboard/mouse still follow focus as usual.
+      SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 
       // Initialize SDL events subsystem
       if (!SDL_InitSubSystem(SDL_INIT_EVENTS)) {
