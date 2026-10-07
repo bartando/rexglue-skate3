@@ -5,6 +5,7 @@ add_executable(unit_tests
     kernel/object_table_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
+    core/thread_test.cpp
     core/sha256_test.cpp
     core/stream_test.cpp
     core/byte_order_test.cpp
