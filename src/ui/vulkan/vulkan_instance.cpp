@@ -46,6 +46,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     const std::filesystem::path local_icd_paths[] = {
         executable_folder / "MoltenVK_icd.json",
         executable_folder / "share" / "vulkan" / "icd.d" / "MoltenVK_icd.json",
+        // .app bundles: codesign rejects non-code files in Contents/MacOS.
+        executable_folder.parent_path() / "Resources" / "vulkan" / "icd.d" /
+            "MoltenVK_icd.json",
     };
     for (const auto& local_icd_path : local_icd_paths) {
       if (std::filesystem::is_regular_file(local_icd_path)) {
