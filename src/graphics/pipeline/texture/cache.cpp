@@ -256,6 +256,8 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
     scaled_resolve_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
   }
+  edge_suspect_global_watch_handle_ =
+      shared_memory.RegisterGlobalWatch(EdgeSuspectGlobalWatchCallbackThunk, this);
 }
 
 TextureCache::~TextureCache() {
@@ -264,6 +266,7 @@ TextureCache::~TextureCache() {
   if (scaled_resolve_global_watch_handle_) {
     shared_memory().UnregisterGlobalWatch(scaled_resolve_global_watch_handle_);
   }
+  shared_memory().UnregisterGlobalWatch(edge_suspect_global_watch_handle_);
 }
 
 bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
@@ -1205,6 +1208,11 @@ TextureCache::Texture::~Texture() {
   if (base_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
   }
+  if (in_edge_suspect_list_) {
+    auto global_lock = texture_cache_.global_critical_region_.Acquire();
+    auto& suspects = texture_cache_.edge_suspect_textures_;
+    suspects.erase(std::find(suspects.begin(), suspects.end(), this));
+  }
 
   if (in_usage_list_) {
     if (used_previous_) {
@@ -1322,6 +1330,28 @@ bool TextureCache::Texture::TryRevalidateEdgePages(
   return true;
 }
 
+bool TextureCache::Texture::ClearEdgeSuspicionIfWritten(uint32_t address_first,
+                                                        uint32_t address_last,
+                                                        bool invalidated_by_gpu) {
+  for (uint32_t slot = 0; slot < 2; ++slot) {
+    EdgePages& edges = edge_pages_[slot];
+    if (!edges.suspect) {
+      continue;
+    }
+    const uint32_t start = (slot ? key().mip_page : key().base_page) << 12;
+    const uint32_t length = slot ? GetGuestMipsSize() : GetGuestBaseSize();
+    if (address_first > start + length - 1 || address_last < start) {
+      continue;
+    }
+    // GPU writes don't reach guest memory, so the edge hashes can't see them.
+    if (invalidated_by_gpu || !OnlyEdgePagesFiring(slot, start, length)) {
+      edges.suspect = false;
+    }
+  }
+  in_edge_suspect_list_ = edge_pages_[0].suspect || edge_pages_[1].suspect;
+  return in_edge_suspect_list_;
+}
+
 void TextureCache::Texture::MarkAsUsed() {
   if (!in_usage_list_) {
     return;
@@ -1362,6 +1392,10 @@ void TextureCache::Texture::WatchCallback(
       !invalidated_by_gpu &&
       OnlyEdgePagesFiring(slot, (is_mip ? key().mip_page : key().base_page) << 12,
                           is_mip ? GetGuestMipsSize() : GetGuestBaseSize());
+  if (edge_pages_[slot].suspect && !in_edge_suspect_list_) {
+    in_edge_suspect_list_ = true;
+    texture_cache().edge_suspect_textures_.push_back(this);
+  }
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -1381,6 +1415,21 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
   Texture& texture = *static_cast<Texture*>(context);
   texture.WatchCallback(global_lock, argument != 0, invalidated_by_gpu);
   texture.texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
+}
+
+void TextureCache::EdgeSuspectGlobalWatchCallbackThunk(
+    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
+  auto& suspects = static_cast<TextureCache*>(context)->edge_suspect_textures_;
+  for (size_t i = 0; i < suspects.size();) {
+    if (suspects[i]->ClearEdgeSuspicionIfWritten(address_first, address_last,
+                                                 invalidated_by_gpu)) {
+      ++i;
+      continue;
+    }
+    suspects[i] = suspects.back();
+    suspects.pop_back();
+  }
 }
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {

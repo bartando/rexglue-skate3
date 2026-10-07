@@ -278,6 +278,9 @@ class TextureCache {
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip,
                        bool invalidated_by_gpu);
+    // Returns whether the texture is still edge-suspect after the write.
+    bool ClearEdgeSuspicionIfWritten(uint32_t address_first, uint32_t address_last,
+                                     bool invalidated_by_gpu);
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -340,6 +343,7 @@ class TextureCache {
       bool suspect = false;
     };
     EdgePages edge_pages_[2];
+    bool in_edge_suspect_list_ = false;
 
     void Watch(uint32_t slot);
     void CaptureEdgePages(uint32_t slot, uint32_t start, uint32_t length);
@@ -685,6 +689,15 @@ class TextureCache {
 
   // Global watch for scaled resolve data invalidation.
   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+
+  // A suspect texture's watch is gone, so a resolve or a CPU write past its
+  // edge pages would go unnoticed and the edge hashes would wrongly
+  // revalidate it. This global watch catches those writes instead.
+  static void EdgeSuspectGlobalWatchCallbackThunk(
+      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
+      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
+  std::vector<Texture*> edge_suspect_textures_;
+  SharedMemory::GlobalWatchHandle edge_suspect_global_watch_handle_ = nullptr;
 
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
