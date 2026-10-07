@@ -1303,17 +1303,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         }
       }
 
-      id_vector_temp_.clear();
-      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantTextureSwizzledSigns));
-      id_vector_temp_.push_back(builder_->makeIntConstant(fetch_constant_index >> 4));
-      id_vector_temp_.push_back(builder_->makeIntConstant((fetch_constant_index >> 2) & 3));
-      // All 32 bits containing the values for 4 fetch constants (use
-      // OpBitFieldUExtract to get the signednesses for the specific components
-      // of this texture).
-      spv::Id swizzled_signs_word = builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
-                                      id_vector_temp_),
-          spv::NoPrecision);
+      spv::Id swizzled_signs_word = LoadTextureSwizzledSignsWord(fetch_constant_index);
       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
 
       spv::Builder::TextureParameters texture_parameters = {};
@@ -2102,6 +2092,27 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     result_vector = result[result_component_index];
   }
   StoreResult(instr.result, result_vector);
+}
+
+spv::Id SpirvShaderTranslator::LoadTextureSwizzledSignsWord(uint32_t fetch_constant_index) {
+  uint32_t word_index = fetch_constant_index >> 2;
+  if (is_pixel_shader() && GetSpirvShaderModification().pixel.texture_signs_specialized) {
+    spv::Id& spec_constant = spec_texture_swizzled_signs_[word_index];
+    if (spec_constant == spv::NoResult) {
+      spec_constant = builder_->makeUintConstant(0, true);
+      builder_->addDecoration(spec_constant, spv::DecorationSpecId,
+                              int(kSpecIdTextureSwizzledSigns + word_index));
+    }
+    return spec_constant;
+  }
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantTextureSwizzledSigns));
+  id_vector_temp_.push_back(builder_->makeIntConstant(int(word_index >> 2)));
+  id_vector_temp_.push_back(builder_->makeIntConstant(int(word_index & 3)));
+  return builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+                                                          uniform_system_constants_,
+                                                          id_vector_temp_),
+                              spv::NoPrecision);
 }
 
 size_t SpirvShaderTranslator::FindOrAddTextureBinding(uint32_t fetch_constant,

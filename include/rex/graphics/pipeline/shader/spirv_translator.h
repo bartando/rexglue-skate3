@@ -92,6 +92,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // don't need it because a sample mask output is costly on some hosts
       // (Metal) even if not written.
       uint32_t alpha_to_coverage : 1;
+      // Texture swizzled signs come from specialization constants (starting at
+      // kSpecIdTextureSwizzledSigns) instead of the system constants, so the
+      // host compiler can drop the paths for signednesses not in use.
+      uint32_t texture_signs_specialized : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -107,6 +111,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
              vertex.vertex_kill_and;
     }
   };
+
+  // One uint32 specialization constant per 4 fetch constants, matching
+  // SystemConstants::texture_swizzled_signs.
+  static constexpr uint32_t kSpecIdTextureSwizzledSigns = 0;
+  static constexpr uint32_t kTextureSwizzledSignsWordCount = 8;
 
   enum : uint32_t {
     kSysFlag_VertexIndexLoad_Shift,
@@ -403,6 +412,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     bool demote_to_helper_invocation;
     bool sample_rate_shading;
+
+    // NoContraction keeps the host from fusing multiply-add like Xenos never
+    // does. SPIRV-Cross lowers every NoContraction operation for Metal to an
+    // [[clang::optnone]] function call, which made pixel shaders about 3x
+    // slower on Apple GPUs. Vertex shaders keep it regardless, since position
+    // invariance across passes depends on it.
+    bool pixel_shader_no_contraction;
   };
 
   SpirvShaderTranslator(const Features& features, bool native_2x_msaa_with_attachments,
@@ -693,6 +709,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id PWLGammaToLinear(spv::Id gamma, bool gamma_pre_saturated);
   spv::Id LinearToPWLGamma(spv::Id linear, bool linear_pre_saturated);
 
+  // Returns the swizzled signs of 4 fetch constants including the given one.
+  spv::Id LoadTextureSwizzledSignsWord(uint32_t fetch_constant_index);
   size_t FindOrAddTextureBinding(uint32_t fetch_constant, xenos::FetchOpDimension dimension,
                                  bool is_signed);
   size_t FindOrAddSamplerBinding(uint32_t fetch_constant, xenos::TextureFilter mag_filter,
@@ -979,6 +997,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // needed by vfetch_mini - int.
   spv::Id var_main_vfetch_address_;
   // float.
+  // Lazily created specialization constants for texture swizzled signs.
+  spv::Id spec_texture_swizzled_signs_[kTextureSwizzledSignsWordCount];
   spv::Id var_main_tfetch_lod_;
   // float3.
   spv::Id var_main_tfetch_gradients_h_;

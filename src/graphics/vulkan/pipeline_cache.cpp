@@ -61,6 +61,10 @@ REXCVAR_DEFINE_BOOL(vulkan_host_alpha_to_coverage, true, "GPU/Vulkan",
                     "Use the host's alpha to coverage instead of emulating the guest dithering "
                     "pattern with a shader sample mask output, which is very slow on Metal")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_specialize_texture_signs, true, "GPU/Vulkan",
+                    "Bake texture signedness into pixel shader pipelines as specialization "
+                    "constants, so unused signed and gamma paths compile out")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1111,6 +1115,8 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
     }
   }
 
+  modification.pixel.texture_signs_specialized =
+      uint32_t(REXCVAR_GET(vulkan_specialize_texture_signs));
   return modification;
 }
 
@@ -1524,6 +1530,18 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     description_out.alpha_to_coverage =
         uint32_t(UseHostAlphaToCoverage() && pixel_shader->shader().writes_color_target(0) &&
                  regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable);
+    if (pixel_shader_modification.pixel.texture_signs_specialized) {
+      const VulkanTextureCache& texture_cache = command_processor_.texture_cache();
+      uint32_t textures_remaining =
+          static_cast<const SpirvShader&>(pixel_shader->shader()).GetUsedTextureMaskAfterTranslation();
+      uint32_t texture_index;
+      while (rex::bit_scan_forward(textures_remaining, &texture_index)) {
+        textures_remaining &= ~(UINT32_C(1) << texture_index);
+        description_out.pixel_texture_swizzled_signs[texture_index >> 2] |=
+            uint32_t(texture_cache.GetActiveTextureSwizzledSigns(texture_index))
+            << (8 * (texture_index & 3));
+      }
+    }
   }
   description_out.render_pass_key = render_pass_key;
 
@@ -3258,6 +3276,25 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   shader_stage_fragment.module = VK_NULL_HANDLE;
   shader_stage_fragment.pName = "main";
   shader_stage_fragment.pSpecializationInfo = nullptr;
+  VkSpecializationMapEntry texture_signs_map_entries
+      [SpirvShaderTranslator::kTextureSwizzledSignsWordCount];
+  VkSpecializationInfo texture_signs_specialization_info;
+  if (creation_arguments.pixel_shader && fragment_shader_override == VK_NULL_HANDLE &&
+      SpirvShaderTranslator::Modification(description.pixel_shader_modification)
+          .pixel.texture_signs_specialized) {
+    for (uint32_t i = 0; i < SpirvShaderTranslator::kTextureSwizzledSignsWordCount; ++i) {
+      texture_signs_map_entries[i].constantID =
+          SpirvShaderTranslator::kSpecIdTextureSwizzledSigns + i;
+      texture_signs_map_entries[i].offset = sizeof(uint32_t) * i;
+      texture_signs_map_entries[i].size = sizeof(uint32_t);
+    }
+    texture_signs_specialization_info.mapEntryCount =
+        SpirvShaderTranslator::kTextureSwizzledSignsWordCount;
+    texture_signs_specialization_info.pMapEntries = texture_signs_map_entries;
+    texture_signs_specialization_info.dataSize = sizeof(description.pixel_texture_swizzled_signs);
+    texture_signs_specialization_info.pData = description.pixel_texture_swizzled_signs;
+    shader_stage_fragment.pSpecializationInfo = &texture_signs_specialization_info;
+  }
   if (fragment_shader_override != VK_NULL_HANDLE) {
     shader_stage_fragment.module = fragment_shader_override;
   } else if (creation_arguments.pixel_shader) {

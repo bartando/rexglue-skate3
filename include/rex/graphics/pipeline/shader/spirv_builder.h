@@ -34,6 +34,9 @@ class SpirvBuilder : public spv::Builder {
   spv::Id createQuadOp(spv::Op op_code, spv::Id type_id, spv::Id operand1, spv::Id operand2,
                        spv::Id operand3, spv::Id operand4);
 
+  // When disabled, the NoContraction helpers emit plain operations.
+  void setNoContractionEnabled(bool enabled) { no_contraction_enabled_ = enabled; }
+
   spv::Id createNoContractionUnaryOp(spv::Op op_code, spv::Id type_id, spv::Id operand);
   spv::Id createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                    spv::Id operand2);
@@ -141,6 +144,9 @@ class SpirvBuilder : public spv::Builder {
 
     Branch current_branch_ = Branch::kSelection;
   };
+
+ private:
+  bool no_contraction_enabled_ = true;
 };
 
 }  // namespace rex::graphics

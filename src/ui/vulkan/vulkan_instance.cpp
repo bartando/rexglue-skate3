@@ -24,6 +24,10 @@
 #include <rex/ui/vulkan/presenter.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, false, "UI/Vulkan", "Log Vulkan debug messages");
+REXCVAR_DEFINE_BOOL(vulkan_moltenvk_precise_math, true, "UI/Vulkan",
+                    "Compile Metal shaders without fast math on MoltenVK, keeping the NaN, "
+                    "infinity and signed zero behavior the Xenos shader emulation relies on")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex {
 namespace ui {
@@ -127,6 +131,9 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   // #395.
   requested_extensions.emplace("VK_KHR_portability_enumeration",
                                &vulkan_instance->extensions_.ext_KHR_portability_enumeration);
+  // #497.
+  requested_extensions.emplace("VK_EXT_layer_settings",
+                               &vulkan_instance->extensions_.ext_EXT_layer_settings);
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
@@ -345,6 +352,19 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   instance_create_info.ppEnabledLayerNames = enabled_layers.data();
   instance_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
   instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
+  // MoltenVK's default fast math lets the Metal compiler assume no NaN or
+  // infinity, which can fold away the select in the Xenos "0 * anything = 0"
+  // multiplication emulation. Settings for other layers or drivers are ignored.
+  const int32_t moltenvk_fast_math_never = 0;
+  VkLayerSettingEXT moltenvk_fast_math_setting = {
+      "MoltenVK", "MVK_CONFIG_FAST_MATH_ENABLED", VK_LAYER_SETTING_TYPE_INT32_EXT, 1,
+      &moltenvk_fast_math_never};
+  VkLayerSettingsCreateInfoEXT layer_settings_create_info = {
+      VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT, nullptr, 1, &moltenvk_fast_math_setting};
+  if (vulkan_instance->extensions_.ext_EXT_layer_settings &&
+      REXCVAR_GET(vulkan_moltenvk_precise_math)) {
+    instance_create_info.pNext = &layer_settings_create_info;
+  }
   VkResult instance_create_result =
       ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
 

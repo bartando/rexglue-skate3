@@ -203,8 +203,12 @@ class VulkanPipelineCache {
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
+    // SystemConstants::texture_swizzled_signs, only for the textures the pixel
+    // shader fetches, when they're specialization constants in it.
+    uint32_t pixel_texture_swizzled_signs[SpirvShaderTranslator::kTextureSwizzledSignsWordCount];
+
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20261006;
+    static constexpr uint32_t kVersion = 0x20261007;
     PipelineDescription() {
       Reset();
     }
