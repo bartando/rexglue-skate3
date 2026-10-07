@@ -292,6 +292,21 @@ TEST_CASE("cvar reset and diff utilities", "[cvar]") {
     CHECK(REXCVAR_GET(test_int32_flag) == 42);
   }
 
+  SECTION("SetDefaultValue moves the default") {
+    REXCVAR_SET(test_int32_flag, 100);
+    CHECK(rex::cvar::SetDefaultValue("test_int32_flag", "7"));
+    CHECK(REXCVAR_GET(test_int32_flag) == 7);
+    CHECK_FALSE(rex::cvar::HasNonDefaultValue("test_int32_flag"));
+
+    REXCVAR_SET(test_int32_flag, 42);
+    CHECK(rex::cvar::HasNonDefaultValue("test_int32_flag"));
+    rex::cvar::ResetToDefault("test_int32_flag");
+    CHECK(REXCVAR_GET(test_int32_flag) == 7);
+
+    CHECK_FALSE(rex::cvar::SetDefaultValue("no_such_flag", "1"));
+    CHECK(rex::cvar::SetDefaultValue("test_int32_flag", "42"));
+  }
+
   SECTION("ListModifiedFlags returns changed flags") {
     REXCVAR_SET(test_int32_flag, 42);    // Default
     REXCVAR_SET(test_bool_flag, false);  // Default

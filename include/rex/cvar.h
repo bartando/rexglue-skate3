@@ -202,6 +202,9 @@ void ClearPendingRestartFlags();
 void ResetToDefault(std::string_view name);
 void ResetAllToDefaults();
 bool HasNonDefaultValue(std::string_view name);
+// Replaces a flag's default and applies it, keeping command line and
+// environment overrides. Call before LoadConfig so config values win too.
+bool SetDefaultValue(std::string_view name, std::string_view value);
 std::vector<std::string> ListModifiedFlags();
 std::string SerializeToTOML();
 std::string SerializeToTOML(std::string_view category);

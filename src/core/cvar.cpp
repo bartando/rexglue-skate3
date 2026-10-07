@@ -508,6 +508,27 @@ bool HasNonDefaultValue(std::string_view name) {
   return entry.getter() != entry.default_value;
 }
 
+bool SetDefaultValue(std::string_view name, std::string_view value) {
+  std::lock_guard lock(GetRegistryMutex());
+  auto it = GetRegistryIndex().find(std::string(name));
+  if (it == GetRegistryIndex().end() || !SetFlagByName(name, value)) {
+    return false;
+  }
+  auto& entry = GetRegistryStorage()[it->second];
+  entry.default_value = entry.getter();
+
+  // Explicit command line and environment values still beat the new default.
+  for (const auto& [cli_name, cli_value] : GetCommandLineOverrides()) {
+    if (cli_name == name) {
+      SetFlagByName(cli_name, cli_value);
+    }
+  }
+  if (const char* env_value = std::getenv(FlagNameToEnvVar(name).c_str())) {
+    entry.setter(env_value);
+  }
+  return true;
+}
+
 std::vector<std::string> ListModifiedFlags() {
   std::lock_guard lock(GetRegistryMutex());
   std::vector<std::string> result;
