@@ -703,7 +703,7 @@ void ImGuiDrawer::RenderDrawLists(ImDrawData* data, UIDrawContext& ui_draw_conte
 
   immediate_drawer_->Begin(ui_draw_context, io.DisplaySize.x, io.DisplaySize.y);
 
-  for (int i = 0; i < data->CmdListsCount; ++i) {
+  for (int i = 0; i < data->CmdLists.Size; ++i) {
     const auto cmd_list = data->CmdLists[i];
 
     ImmediateDrawBatch batch;
