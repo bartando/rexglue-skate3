@@ -312,10 +312,15 @@ bool ReXApp::OnInitialize() {
 }
 
 bool ReXApp::SetupEnvironment() {
-  // App root, not executable folder: inside a macOS .app bundle the config
-  // and logs stay next to the bundle, where users can find them.
-  auto exe_dir = rex::filesystem::GetAppRootFolder();
-  auto config_path = exe_dir / (std::string(GetName()) + ".toml");
+  auto config_dir = rex::filesystem::GetAppRootFolder();
+#if REX_PLATFORM_MAC
+  // Bundles may live in /Applications, a read-only DMG, or AppTranslocation.
+  // Keep their writable files with the existing per-user saves and caches.
+  if (config_dir != rex::filesystem::GetExecutableFolder()) {
+    config_dir = rex::filesystem::GetUserFolder() / GetName();
+  }
+#endif
+  auto config_path = config_dir / (std::string(GetName()) + ".toml");
 
   // Load config before resolving cvar-backed paths such as game_data_root.
   if (std::filesystem::exists(config_path))
@@ -417,7 +422,7 @@ bool ReXApp::SetupEnvironment() {
                                         log_level_str, category_levels);
   if (log_file_cvar.empty()) {
     log_config.app_name = std::string(GetName());
-    log_config.log_dir = (exe_dir / "logs").string();
+    log_config.log_dir = (config_path_.parent_path() / "logs").string();
   }
 
   rex::InitLogging(log_config);
