@@ -525,6 +525,15 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
     return;
   }
   pipeline_storage_file_flush_needed_ = false;
+  // The initial read position of a+b is implementation-defined: Darwin starts
+  // at EOF. Seek explicitly before reading, otherwise a valid cache looks
+  // empty and is truncated instead of precompiled on every launch.
+  if (!rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_SET)) {
+    REXGPU_ERROR("Failed to seek Vulkan pipeline storage; leaving the cache unchanged");
+    fclose(pipeline_storage_file_);
+    pipeline_storage_file_ = nullptr;
+    return;
+  }
   // 'XEPS'.
   const uint32_t pipeline_storage_magic = 0x53504558;
   const uint32_t pipeline_storage_magic_api = edram_fragment_shader_interlock ? 1u : 0u;
@@ -605,6 +614,14 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
         "Failed to open the guest shader storage file for writing, persistent "
         "shader storage will be disabled: {}",
         rex::path_to_utf8(shader_storage_file_path));
+    fclose(pipeline_storage_file_);
+    pipeline_storage_file_ = nullptr;
+    return;
+  }
+  if (!rex::filesystem::Seek(shader_storage_file_, 0, SEEK_SET)) {
+    REXGPU_ERROR("Failed to seek guest shader storage; leaving the caches unchanged");
+    fclose(shader_storage_file_);
+    shader_storage_file_ = nullptr;
     fclose(pipeline_storage_file_);
     pipeline_storage_file_ = nullptr;
     return;
@@ -3859,7 +3876,12 @@ void VulkanPipelineCache::StorageWriteThread() {
         flush_pipelines = true;
       }
       if (!shader && !write_pipeline) {
-        storage_write_request_cond_.wait(lock);
+        // Flush requests are work too. Waiting here with a pending flush
+        // leaves the last shaders/pipelines buffered until another request,
+        // so an interrupted session may never save them for the next launch.
+        if (!flush_shaders && !flush_pipelines) {
+          storage_write_request_cond_.wait(lock);
+        }
         continue;
       }
     }
