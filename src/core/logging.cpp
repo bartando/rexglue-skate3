@@ -240,21 +240,34 @@ void InitLogging(const LogConfig& config) {
   }
 
   // File sink (rotating) with sequential naming fallback
-  std::string resolved_path;
-  if (config.log_file) {
-    resolved_path = config.log_file;
-  } else if (!config.app_name.empty()) {
-    auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
-                                          : std::filesystem::path(config.log_dir);
-    resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+  std::string file_error;
+  try {
+    std::string resolved_path;
+    if (config.log_file) {
+      resolved_path = config.log_file;
+    } else if (!config.app_name.empty()) {
+      auto log_dir = config.log_dir.empty() ? std::filesystem::current_path() / "logs"
+                                            : std::filesystem::path(config.log_dir);
+      resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
+    }
+    if (!resolved_path.empty()) {
+      auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+          resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
+          static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
+      sink->set_level(spdlog::level::trace);
+      sink->set_pattern(config.file_pattern);
+      g_file_sink = sink;
+    }
+  } catch (const std::filesystem::filesystem_error& error) {
+    file_error = error.what();
+  } catch (const spdlog::spdlog_ex& error) {
+    file_error = error.what();
   }
-  if (!resolved_path.empty()) {
-    auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-        resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
-        static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
-    sink->set_level(spdlog::level::trace);
-    sink->set_pattern(config.file_pattern);
-    g_file_sink = sink;
+  // A failed log file must not prevent startup. Keep a visible error channel
+  // even when this GUI application normally uses file-only logging.
+  if (!file_error.empty() && !g_console_sink) {
+    g_console_sink = std::make_shared<spdlog::sinks::stderr_color_sink_mt>();
+    g_console_sink->set_pattern(config.console_pattern);
   }
 
   g_extra_sinks = config.extra_sinks;
@@ -278,6 +291,8 @@ void InitLogging(const LogConfig& config) {
     }
   }
   g_initialized = true;
+  if (!file_error.empty())
+    spdlog::warn("File logging disabled: {}", file_error);
 
   // Periodic flush
   int flush_interval = REXCVAR_GET(log_flush_interval);
