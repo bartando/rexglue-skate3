@@ -35,6 +35,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/perf/hitch_diagnostics.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
@@ -2832,6 +2833,7 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  rex::perf::hitch::RecordSwap();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -10602,6 +10604,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
       // blocked time in builds without perf counters - cheap around a
       // blocking wait.
       const std::chrono::steady_clock::time_point wait_start = std::chrono::steady_clock::now();
+      rex::perf::hitch::ScopedOperation diagnostic_wait(
+          rex::perf::hitch::Operation::kGpuWait);
       wait_result =
           dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                               submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);

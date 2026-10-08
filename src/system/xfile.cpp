@@ -11,6 +11,7 @@
 
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
+#include <rex/perf/hitch_diagnostics.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/stream.h>
@@ -104,6 +105,7 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info, size_t le
 
 X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length, uint64_t byte_offset,
                      uint32_t* out_bytes_read, uint32_t apc_context, bool notify_completion) {
+  rex::perf::hitch::ScopedOperation diagnostic_read(rex::perf::hitch::Operation::kFileRead);
   std::lock_guard<std::mutex> lock(file_lock_);
   return ReadInternal(buffer_guest_address, buffer_length, byte_offset, out_bytes_read, apc_context,
                       notify_completion);
@@ -200,6 +202,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
 
 X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, uint64_t byte_offset,
                             uint32_t* out_bytes_read, uint32_t apc_context) {
+  rex::perf::hitch::ScopedOperation diagnostic_read(rex::perf::hitch::Operation::kFileRead);
   std::lock_guard<std::mutex> lock(file_lock_);
   X_STATUS result = X_STATUS_SUCCESS;
 

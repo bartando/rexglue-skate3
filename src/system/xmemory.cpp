@@ -19,6 +19,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/perf/hitch_diagnostics.h>
 #include <rex/math.h>
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
@@ -612,6 +613,7 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
             "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
             "guest_protect {:08X})",
             virtual_address, static_cast<uint64_t>(page_base), guest_protect);
+        rex::perf::hitch::RecordStaleProtectionRecovery();
         return true;
       }
     }

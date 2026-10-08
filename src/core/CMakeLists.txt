@@ -13,6 +13,7 @@ add_library(rexcore OBJECT
     filesystem_wildcard.cpp
     guest_presence.cpp
     logging.cpp
+    perf/hitch_diagnostics.cpp
     memory.cpp
     mutex.cpp
     ring_buffer.cpp

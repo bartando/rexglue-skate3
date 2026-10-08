@@ -26,6 +26,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/perf/hitch_diagnostics.h>
 #include <rex/dbg.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
@@ -3663,8 +3664,13 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
-                                                         &pipeline_create_info, nullptr, &pipeline);
+  VkResult create_result;
+  {
+    rex::perf::hitch::ScopedOperation diagnostic_compile(
+        rex::perf::hitch::Operation::kPipelineCompile);
+    create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                 &pipeline_create_info, nullptr, &pipeline);
+  }
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
