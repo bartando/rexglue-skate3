@@ -34,7 +34,8 @@ uint8_t tzcnt(uint64_t v) {
 }
 
 bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
-  int i = ffs(v);
+  // The native PS5 libc does not export ffs; use the compiler primitive.
+  int i = __builtin_ffs(static_cast<int>(v));
   *out_first_set_index = i - 1;
   return i != 0;
 }

@@ -32,6 +32,8 @@
 #define REX_PLATFORM_MAC 1
 #elif defined(WIN32) || defined(_WIN32)
 #define REX_PLATFORM_WIN32 1
+#elif defined(__PROSPERO__)
+#define REX_PLATFORM_PS5 1
 #elif defined(__ANDROID__)
 #define REX_PLATFORM_ANDROID 1
 #define REX_PLATFORM_LINUX 1
@@ -58,6 +60,9 @@
 #endif
 #ifndef REX_PLATFORM_LINUX
 #define REX_PLATFORM_LINUX 0
+#endif
+#ifndef REX_PLATFORM_PS5
+#define REX_PLATFORM_PS5 0
 #endif
 
 #if defined(__clang__)
