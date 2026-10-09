@@ -375,8 +375,9 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       if (i == block_last && (page_last & 31) != 31) {
         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      scaled_resolve_pages_[i] |= add_bits;
-      scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+      __atomic_fetch_or(&scaled_resolve_pages_[i], add_bits, __ATOMIC_RELAXED);
+      __atomic_fetch_or(&scaled_resolve_pages_l2_[i >> 6], UINT64_C(1) << (i & 63),
+                        __ATOMIC_RELAXED);
     }
   }
 
@@ -1720,9 +1721,11 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
-  auto global_lock = global_critical_region_.Acquire();
+  // Lock-free: the bits are written atomically under the global lock, and an
+  // answer read under the lock is just as stale once it is released. This runs
+  // for every texture lookup, where the global lock is often contended.
   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
-    uint64_t l2_block = scaled_resolve_pages_l2_[i];
+    uint64_t l2_block = __atomic_load_n(&scaled_resolve_pages_l2_[i], __ATOMIC_RELAXED);
     if (i == l2_block_first) {
       l2_block &= ~((UINT64_C(1) << (block_first & 63)) - 1);
     }
@@ -1740,7 +1743,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
       if (block_index == block_last && (page_last & 31) != 31) {
         check_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      if (scaled_resolve_pages_[block_index] & check_bits) {
+      if (__atomic_load_n(&scaled_resolve_pages_[block_index], __ATOMIC_RELAXED) & check_bits) {
         return true;
       }
     }
@@ -1763,7 +1766,6 @@ bool TextureCache::IsRangeFullyScaledResolved(uint32_t start_unscaled, uint32_t 
   uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
   uint32_t block_first = page_first >> 5;
   uint32_t block_last = page_last >> 5;
-  auto global_lock = global_critical_region_.Acquire();
   for (uint32_t block_index = block_first; block_index <= block_last; ++block_index) {
     uint32_t check_bits = UINT32_MAX;
     if (block_index == block_first) {
@@ -1772,7 +1774,8 @@ bool TextureCache::IsRangeFullyScaledResolved(uint32_t start_unscaled, uint32_t 
     if (block_index == block_last && (page_last & 31) != 31) {
       check_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
     }
-    if ((scaled_resolve_pages_[block_index] & check_bits) != check_bits) {
+    if ((__atomic_load_n(&scaled_resolve_pages_[block_index], __ATOMIC_RELAXED) & check_bits) !=
+        check_bits) {
       return false;
     }
   }
@@ -1804,7 +1807,7 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
   uint32_t resolve_l2_block_first = resolve_block_first >> 6;
   uint32_t resolve_l2_block_last = resolve_block_last >> 6;
   for (uint32_t i = resolve_l2_block_first; i <= resolve_l2_block_last; ++i) {
-    uint64_t resolve_l2_block = scaled_resolve_pages_l2_[i];
+    uint64_t resolve_l2_block = __atomic_load_n(&scaled_resolve_pages_l2_[i], __ATOMIC_RELAXED);
     if (REXCVAR_GET(pre_mask_resolve_l2_block)) {
       // Pre-mask to only process blocks within the write range.
       if (i == resolve_l2_block_first) {
@@ -1825,9 +1828,10 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
       if (resolve_block_index == resolve_block_last && (resolve_page_last & 31) != 31) {
         resolve_keep_bits |= ~((UINT32_C(1) << ((resolve_page_last & 31) + 1)) - 1);
       }
-      scaled_resolve_pages_[resolve_block_index] &= resolve_keep_bits;
-      if (scaled_resolve_pages_[resolve_block_index] == 0) {
-        scaled_resolve_pages_l2_[i] &= ~(UINT64_C(1) << resolve_block_relative_index);
+      if (!__atomic_and_fetch(&scaled_resolve_pages_[resolve_block_index], resolve_keep_bits,
+                              __ATOMIC_RELAXED)) {
+        __atomic_fetch_and(&scaled_resolve_pages_l2_[i],
+                           ~(UINT64_C(1) << resolve_block_relative_index), __ATOMIC_RELAXED);
       }
     }
   }

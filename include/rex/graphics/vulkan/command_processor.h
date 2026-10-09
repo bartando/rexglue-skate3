@@ -885,6 +885,30 @@ class VulkanCommandProcessor : public CommandProcessor {
 #else
   static constexpr uint32_t kMaxGpuTimestampQueriesPerFrame = 4096;
 #endif
+  // vulkan_gpu_frame_timer: one start/end timestamp pair per frame, read back
+  // without waiting, logged as averages. Independent of the bucket profiler.
+  static constexpr uint32_t kFrameTimerSlots = 16;
+  VkQueryPool frame_timer_pool_ = VK_NULL_HANDLE;
+  uint64_t frame_timer_slot_frame_[kFrameTimerSlots] = {};
+  uint64_t frame_timer_last_end_ = 0;
+  uint64_t frame_timer_frames_ = 0;
+  uint64_t frame_timer_busy_ns_ = 0;
+  uint64_t frame_timer_busy_max_ns_ = 0;
+  uint64_t frame_timer_period_ns_ = 0;
+  uint64_t frame_timer_periods_ = 0;
+  // Per-submission start/end pairs: their sum is GPU work per frame without
+  // the idle gaps between a frame's submissions.
+  static constexpr uint32_t kSubmissionTimerSlots = 64;
+  VkQueryPool submission_timer_pool_ = VK_NULL_HANDLE;
+  bool submission_timer_pending_[kSubmissionTimerSlots] = {};
+  uint32_t submission_timer_next_slot_ = 0;
+  uint64_t submission_timer_work_ns_ = 0;
+  uint64_t submission_timer_count_ = 0;
+  void FrameTimerBeginFrame();
+  void FrameTimerEndFrame();
+  uint32_t SubmissionTimerBegin(VkCommandBuffer command_buffer);
+  void SubmissionTimerEnd(VkCommandBuffer command_buffer, uint32_t slot);
+  void SubmissionTimerCollect();
   VkQueryPool gpu_timestamp_query_pool_ = VK_NULL_HANDLE;
   VkBuffer gpu_timestamp_readback_buffer_ = VK_NULL_HANDLE;
   VkDeviceMemory gpu_timestamp_readback_memory_ = VK_NULL_HANDLE;

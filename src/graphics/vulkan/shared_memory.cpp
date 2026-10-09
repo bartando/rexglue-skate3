@@ -81,6 +81,7 @@ bool VulkanSharedMemory::Initialize() {
     // Widening a write fault only batches uploads; with nothing to upload it
     // would just fire the watches of every texture near dynamic data.
     set_cpu_invalidation_widen_pages(1);
+    EnableZeroCopyHotPages();
   }
 
   if (!zero_copy_ && REXCVAR_GET(vulkan_sparse_shared_memory) &&

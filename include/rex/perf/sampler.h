@@ -11,7 +11,7 @@
 // absent). Symbolize them offline against the linked ELF.
 namespace rex::perf::sampler {
 
-inline constexpr int kSampleStackWords = 3;
+inline constexpr int kSampleStackWords = 8;
 
 // Starts sampling the calling thread. Ignored if already sampling.
 void StartForCurrentThread(uint32_t hz, std::string_view path);

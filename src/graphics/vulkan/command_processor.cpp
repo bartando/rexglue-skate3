@@ -161,6 +161,11 @@ REXCVAR_DEFINE_BOOL(vulkan_reuse_unchanged_draw_bindings, false, "GPU/Vulkan",
                     "binding views")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_gpu_frame_timer, false, "GPU/Vulkan",
+                    "Log the GPU time of each frame (first to last command) and the GPU "
+                    "frame period, averaged over 120 frames")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_BOOL(vulkan_gpu_timestamp_buckets, false, "GPU/Vulkan",
                     "Measure per-bucket GPU times (guest draws, resolves, render target dumps) "
                     "with timestamp queries and report them in the FPS overlay")
@@ -2452,6 +2457,11 @@ bool VulkanCommandProcessor::SetupContext() {
 
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  if (frame_timer_pool_ != VK_NULL_HANDLE) {
+    GetVulkanDevice()->functions().vkDestroyQueryPool(GetVulkanDevice()->device(),
+                                                      frame_timer_pool_, nullptr);
+    frame_timer_pool_ = VK_NULL_HANDLE;
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownGpuTimestampResources();
   ShutdownOcclusionQueryResources();
@@ -9951,6 +9961,143 @@ void VulkanCommandProcessor::ShutdownGpuTimestampResources() {
   }
 }
 
+void VulkanCommandProcessor::FrameTimerBeginFrame() {
+  if (!REXCVAR_GET(vulkan_gpu_frame_timer)) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  const double period_ns = vulkan_device->properties().timestampPeriod;
+  if (period_ns <= 0.0) {
+    return;
+  }
+  if (frame_timer_pool_ == VK_NULL_HANDLE) {
+    VkQueryPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    pool_info.queryCount = kFrameTimerSlots * 2;
+    if (dfn.vkCreateQueryPool(device, &pool_info, nullptr, &frame_timer_pool_) != VK_SUCCESS) {
+      REXGPU_WARN("GPU frame timer: could not create a query pool");
+      return;
+    }
+    std::fill(std::begin(frame_timer_slot_frame_), std::end(frame_timer_slot_frame_), UINT64_MAX);
+  }
+
+  SubmissionTimerCollect();
+  // Collect the frame half the slots back: long since submitted, so
+  // usually finished, and its slot not yet reused.
+  const uint32_t old_slot = uint32_t((frame_current_ + kFrameTimerSlots / 2) % kFrameTimerSlots);
+  if (frame_timer_slot_frame_[old_slot] != UINT64_MAX) {
+    uint64_t results[4] = {};  // start, start available, end, end available
+    const VkResult result = dfn.vkGetQueryPoolResults(
+        device, frame_timer_pool_, old_slot * 2, 2, sizeof(results), results,
+        sizeof(uint64_t) * 2, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    frame_timer_slot_frame_[old_slot] = UINT64_MAX;
+    if ((result == VK_SUCCESS || result == VK_NOT_READY) && results[1] && results[3] &&
+        results[2] > results[0]) {
+      const uint64_t busy_ns = uint64_t(double(results[2] - results[0]) * period_ns);
+      frame_timer_busy_ns_ += busy_ns;
+      frame_timer_busy_max_ns_ = std::max(frame_timer_busy_max_ns_, busy_ns);
+      if (frame_timer_last_end_ && results[2] > frame_timer_last_end_) {
+        frame_timer_period_ns_ += uint64_t(double(results[2] - frame_timer_last_end_) * period_ns);
+        ++frame_timer_periods_;
+      }
+      frame_timer_last_end_ = results[2];
+      if (++frame_timer_frames_ == 120) {
+        REXGPU_INFO(
+            "GPU frame timer (120 frames): work avg={:.2f}ms ({} submissions timed), "
+            "first-to-last avg={:.2f}ms max={:.2f}ms, end-to-end period avg={:.2f}ms",
+            submission_timer_work_ns_ / 120 / 1e6, submission_timer_count_,
+            frame_timer_busy_ns_ / 120 / 1e6, frame_timer_busy_max_ns_ / 1e6,
+            frame_timer_periods_ ? frame_timer_period_ns_ / frame_timer_periods_ / 1e6 : 0.0);
+        frame_timer_frames_ = frame_timer_busy_ns_ = frame_timer_busy_max_ns_ = 0;
+        frame_timer_period_ns_ = frame_timer_periods_ = 0;
+        submission_timer_work_ns_ = submission_timer_count_ = 0;
+      }
+    } else {
+      frame_timer_last_end_ = 0;
+    }
+  }
+
+  const uint32_t slot = uint32_t(frame_current_ % kFrameTimerSlots);
+  deferred_command_buffer_.CmdVkResetQueryPool(frame_timer_pool_, slot * 2, 2);
+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                               frame_timer_pool_, slot * 2);
+  frame_timer_slot_frame_[slot] = frame_current_;
+}
+
+uint32_t VulkanCommandProcessor::SubmissionTimerBegin(VkCommandBuffer command_buffer) {
+  if (frame_timer_pool_ == VK_NULL_HANDLE) {
+    return UINT32_MAX;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  if (submission_timer_pool_ == VK_NULL_HANDLE) {
+    VkQueryPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    pool_info.queryCount = kSubmissionTimerSlots * 2;
+    if (dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr,
+                              &submission_timer_pool_) != VK_SUCCESS) {
+      return UINT32_MAX;
+    }
+  }
+  const uint32_t slot = submission_timer_next_slot_++ % kSubmissionTimerSlots;
+  // A slot not read back in time is dropped.
+  submission_timer_pending_[slot] = false;
+  dfn.vkCmdResetQueryPool(command_buffer, submission_timer_pool_, slot * 2, 2);
+  dfn.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          submission_timer_pool_, slot * 2);
+  return slot;
+}
+
+void VulkanCommandProcessor::SubmissionTimerEnd(VkCommandBuffer command_buffer, uint32_t slot) {
+  if (slot == UINT32_MAX) {
+    return;
+  }
+  GetVulkanDevice()->functions().vkCmdWriteTimestamp(
+      command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, submission_timer_pool_, slot * 2 + 1);
+  submission_timer_pending_[slot] = true;
+}
+
+void VulkanCommandProcessor::SubmissionTimerCollect() {
+  if (submission_timer_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const double period_ns = vulkan_device->properties().timestampPeriod;
+  for (uint32_t slot = 0; slot < kSubmissionTimerSlots; ++slot) {
+    if (!submission_timer_pending_[slot]) {
+      continue;
+    }
+    uint64_t results[4] = {};
+    const VkResult result = vulkan_device->functions().vkGetQueryPoolResults(
+        vulkan_device->device(), submission_timer_pool_, slot * 2, 2, sizeof(results), results,
+        sizeof(uint64_t) * 2, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if ((result != VK_SUCCESS && result != VK_NOT_READY) || !results[1] || !results[3]) {
+      continue;  // Not finished yet.
+    }
+    submission_timer_pending_[slot] = false;
+    if (results[2] > results[0]) {
+      submission_timer_work_ns_ += uint64_t(double(results[2] - results[0]) * period_ns);
+      ++submission_timer_count_;
+    }
+  }
+}
+
+void VulkanCommandProcessor::FrameTimerEndFrame() {
+  if (frame_timer_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const uint32_t slot = uint32_t(frame_current_ % kFrameTimerSlots);
+  if (frame_timer_slot_frame_[slot] != frame_current_) {
+    return;
+  }
+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                               frame_timer_pool_, slot * 2 + 1);
+}
+
 void VulkanCommandProcessor::BeginGpuTimestampFrame() {
   const bool timestamp_diagnostics_enabled =
       rex::perf::IsCaptureRecording() || REXCVAR_GET(vulkan_gpu_timestamp_buckets) ||
@@ -11010,6 +11157,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     texture_cache_->BeginFrame();
 
     BeginGpuTimestampFrame();
+    FrameTimerBeginFrame();
   }
 
   return true;
@@ -11171,6 +11319,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
     if (is_closing_frame) {
       EndGpuTimestampFrame();
+      FrameTimerEndFrame();
     }
 
     assert_false(command_buffers_writable_.empty());
@@ -11210,7 +11359,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory_barrier, 0,
                                  nullptr, 0, nullptr);
       }
+      const uint32_t timer_slot = SubmissionTimerBegin(command_buffer.buffer);
       deferred_command_buffer_.Execute(command_buffer.buffer);
+      SubmissionTimerEnd(command_buffer.buffer, timer_slot);
       if (is_closing_frame) {
         ResolveGpuTimestampFrame(command_buffer.buffer);
       }

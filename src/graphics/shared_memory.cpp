@@ -96,6 +96,7 @@ void SharedMemory::InitializeCommon() {
   // Hot pages compare against the shadow; without it they would upload on
   // every request.
   hot_pages_enabled_ = REXCVAR_GET(shared_memory_hot_pages) && upload_shadow_max_chunks_ != 0;
+  hot_tracking_ = hot_pages_enabled_;
   if (hot_pages_enabled_) {
     hot_pages_.assign(num_system_page_flags_, 0);
     hot_excluded_pages_.assign(num_system_page_flags_, 0);
@@ -351,10 +352,19 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
   }
   if (zero_copy_) {
     // No upload protects these pages, so the watch has to: a CPU write must
-    // fault for it to fire.
-    memory().EnablePhysicalMemoryAccessCallbacks(
-        watch_page_first << page_size_log2_,
-        (watch_page_last - watch_page_first + 1) << page_size_log2_, true, false);
+    // fault for it to fire. Hot pages are left unprotected; OnFrameEnd fires
+    // their watches.
+    uint32_t run_first = UINT32_MAX;
+    for (uint32_t page = watch_page_first; page <= watch_page_last + 1; ++page) {
+      const bool protect = page <= watch_page_last && !IsHotPage(page);
+      if (protect && run_first == UINT32_MAX) {
+        run_first = page;
+      } else if (!protect && run_first != UINT32_MAX) {
+        memory().EnablePhysicalMemoryAccessCallbacks(
+            run_first << page_size_log2_, (page - run_first) << page_size_log2_, true, false);
+        run_first = UINT32_MAX;
+      }
+    }
   }
 
   return reinterpret_cast<WatchHandle>(range);
@@ -1084,9 +1094,37 @@ void SharedMemory::WidenUploadRanges() {
   upload_ranges_.swap(widened_upload_ranges_);
 }
 
+void SharedMemory::EnableZeroCopyHotPages() {
+  hot_pages_.assign(num_system_page_flags_, 0);
+  hot_excluded_pages_.assign(num_system_page_flags_, 0);
+  cpu_invalidation_frame_.assign(kBufferSize >> page_size_log2_, 0);
+  cpu_invalidation_streak_.assign(kBufferSize >> page_size_log2_, 0);
+  hot_tracking_ = true;
+}
+
+void SharedMemory::OnFrameEnd() {
+  frame_index_.fetch_add(1, std::memory_order_relaxed);
+  if (!zero_copy_ || !hot_tracking_) {
+    return;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t block = 0; block < uint32_t(hot_pages_.size()); ++block) {
+    uint64_t bits = hot_pages_[block];
+    while (bits) {
+      const uint32_t first = uint32_t(rex::tzcnt(bits));
+      const uint64_t from_first = bits >> first;
+      const uint32_t count = from_first == UINT64_MAX ? 64 - first
+                                                      : uint32_t(rex::tzcnt(~from_first));
+      const uint32_t page_first = (block << 6) + first;
+      FireWatches(page_first, page_first + count - 1, false);
+      bits &= count + first >= 64 ? 0 : ~uint64_t(0) << (first + count);
+    }
+  }
+}
+
 void SharedMemory::NoteCpuInvalidation(uint32_t page_first, uint32_t page_last) {
   // Called with the global lock held, from a guest write fault.
-  if (!hot_pages_enabled_) {
+  if (!hot_tracking_) {
     return;
   }
   const uint32_t frame = frame_index_.load(std::memory_order_relaxed);
@@ -1098,7 +1136,7 @@ void SharedMemory::NoteCpuInvalidation(uint32_t page_first, uint32_t page_last) 
     uint8_t& streak = cpu_invalidation_streak_[page];
     streak = last_frame + 1 == frame ? uint8_t(std::min(streak + 1, 255)) : uint8_t(1);
     last_frame = frame;
-    if (streak >= kHotPageStreak && !PageBit(hot_excluded_pages_, page)) {
+    if (streak >= kHotPageStreak && (zero_copy_ || !PageBit(hot_excluded_pages_, page))) {
       // The fault that got here already unprotected and unwatched the page,
       // and fired (so removed) every watch on it.
       hot_pages_[page >> 6] |= uint64_t(1) << (page & 63);

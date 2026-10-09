@@ -45,7 +45,7 @@ constexpr size_t kMachineContextOffset = 0x40;
 // in this range are kept as likely return addresses.
 constexpr uint64_t kCodeFirst = 0x400000;
 constexpr uint64_t kCodeEnd = 0x20000000;
-constexpr int kStackScanWords = 48;
+constexpr int kStackScanWords = 160;
 
 void OnSignal(int, siginfo_t*, void* signal_context) {
   const auto* mc = reinterpret_cast<const mcontext_t*>(static_cast<uint8_t*>(signal_context) +

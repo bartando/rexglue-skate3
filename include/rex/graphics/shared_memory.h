@@ -129,8 +129,9 @@ class SharedMemory {
   uint32_t firing_address_last() const { return firing_address_last_; }
   const uint8_t* TranslatePhysical(uint32_t address) const;
   void ResetGpuAccessWindow();
-  // Advances the frame index that hot-page detection counts streaks in.
-  void OnFrameEnd() { frame_index_.fetch_add(1, std::memory_order_relaxed); }
+  // Advances the frame index that hot-page detection counts streaks in. In
+  // zero-copy mode also fires the watches on hot pages (see zero_copy_).
+  void OnFrameEnd();
 
  protected:
   // Whether moving an upload ahead of earlier work in the window could change
@@ -149,6 +150,11 @@ class SharedMemory {
   // The buffer is guest memory itself (VulkanSharedMemory zero copy): nothing
   // is uploaded, requests are no-ops, and only watches protect pages.
   bool zero_copy_ = false;
+  // Zero copy still write-protects watched pages (textures). Pages the CPU
+  // rewrites every frame turn hot: their watches no longer protect them and
+  // instead fire once per frame, saving a fault and two protection changes per
+  // page and frame. A texture there sees a mid-frame CPU write a frame late.
+  void EnableZeroCopyHotPages();
   void set_cpu_invalidation_widen_pages(uint32_t pages) { cpu_invalidation_widen_pages_ = pages; }
 
   SharedMemory(memory::Memory& memory);
@@ -284,8 +290,10 @@ class SharedMemory {
   // upload shadow. requested are byte ranges.
   void FilterUnchangedHotPages(const std::pair<uint32_t, uint32_t>* requested, size_t count);
   bool IsHotPage(uint32_t page) const {
-    return hot_pages_enabled_ && ((hot_pages_[page >> 6] >> (page & 63)) & 1);
+    return hot_tracking_ && ((hot_pages_[page >> 6] >> (page & 63)) & 1);
   }
+  // Hot-page streaks are tracked (shared_memory_hot_pages or zero copy).
+  bool hot_tracking_ = false;
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;
