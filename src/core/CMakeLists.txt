@@ -14,6 +14,7 @@ add_library(rexcore OBJECT
     guest_presence.cpp
     logging.cpp
     perf/hitch_diagnostics.cpp
+    perf/thread_cpu.cpp
     memory.cpp
     mutex.cpp
     ring_buffer.cpp

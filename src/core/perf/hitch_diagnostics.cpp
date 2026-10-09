@@ -1,4 +1,5 @@
 #include <rex/perf/hitch_diagnostics.h>
+#include <rex/perf/thread_cpu.h>
 
 #include <algorithm>
 #include <array>
@@ -42,6 +43,7 @@ Sample TakeSample(OperationCounters& counters) {
 }
 
 void LogHostContext(double elapsed_seconds) {
+  thread_cpu::Log(elapsed_seconds);
 #if REX_PLATFORM_MAC
   rusage usage{};
   static double previous_cpu_seconds = 0.0;

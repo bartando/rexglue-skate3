@@ -40,6 +40,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5, "This 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/logging.h>
+#include <rex/perf/thread_cpu.h>
 #include <rex/thread/timer_queue.h>
 
 #include <sched.h>
@@ -804,6 +805,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
   void set_name(const std::string& name) {
     WaitStarted();
+    perf::thread_cpu::SetThreadName(uintptr_t(thread_), name);
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
 #if REX_PLATFORM_MAC
@@ -1486,6 +1488,8 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
 
   current_thread_ = thread;
   current_thread_condition_ = &thread->handle_;
+  // Before the started state is published, so set_name() finds the entry.
+  perf::thread_cpu::RegisterCurrentThread();
   {
     // The suspend count must be published together with the state: Resume()
     // can run as soon as WaitStarted() sees it, and would otherwise find a
@@ -1518,6 +1522,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.cond_.notify_all();
   }
 
+  perf::thread_cpu::UnregisterCurrentThread();
   current_thread_ = nullptr;
   current_thread_condition_ = nullptr;
   return nullptr;
@@ -1576,6 +1581,7 @@ void Thread::Exit(int exit_code) {
 }
 
 void set_current_thread_name(const std::string_view name) {
+  perf::thread_cpu::SetThreadName(uintptr_t(pthread_self()), name);
 #if REX_PLATFORM_MAC || REX_PLATFORM_PS5
 #if REX_PLATFORM_PS5
   pthread_set_name_np(pthread_self(), std::string(name).c_str());
