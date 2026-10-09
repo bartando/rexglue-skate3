@@ -12,6 +12,8 @@
 
 #include <cstring>
 #include <queue>
+#include <map>
+#include <vector>
 
 #include <rex/math.h>
 #include <rex/system/xobject.h>
@@ -67,6 +69,44 @@ struct N_XSOCKADDR_IN {
   char x_sin_zero[8];
 };
 
+// Guest ports below 1024 live at 10000 + instance * 1024 + port on the host.
+// The PS5 (FreeBSD) refuses them to a non-root title, every peer has to make
+// the same choice, and the instance (net_instance) lets several titles share
+// a host: the port a datagram comes from tells which instance sent it.
+inline constexpr uint16_t kLowPortHostBase = 10000;
+inline constexpr uint32_t kMaxInstances = 8;
+uint32_t LocalInstance();
+inline bool IsInstancePort(uint16_t port) {
+  return port >= kLowPortHostBase && port < kLowPortHostBase + kMaxInstances * 1024;
+}
+inline uint16_t GuestToHostPort(uint16_t port, uint32_t instance) {
+  return port && port < 1024 ? uint16_t(kLowPortHostBase + instance * 1024 + port) : port;
+}
+inline uint16_t GuestToHostPort(uint16_t port) {
+  return GuestToHostPort(port, LocalInstance());
+}
+inline uint16_t HostToGuestPort(uint16_t port) {
+  return IsInstancePort(port) ? uint16_t((port - kLowPortHostBase) % 1024) : port;
+}
+inline uint32_t InstanceOfHostPort(uint16_t port) {
+  return IsInstancePort(port) ? uint32_t(port - kLowPortHostBase) / 1024 : 0;
+}
+
+// XNet security associations. On a console, XNetXnAddrToInAddr gives every
+// (peer, session key) pair its own opaque IN_ADDR, and titles open one
+// connection per address: a host with a game and a spectator session sees a
+// guest twice. Here each pair gets a virtual address (1.0.0.N); datagrams to
+// it go to the peer's real address and instance with the session key in
+// front, and come back from the virtual address again. Key 0 is a peer
+// instance on a shared address without a session: no tag.
+inline constexpr uint32_t kVirtualAddressBase = 0x01000000;
+bool IsVirtualAddress(uint32_t address);
+// Returns the virtual address of (peer, instance, key), creating it if needed.
+uint32_t AssociationAddress(uint32_t peer_address, uint32_t instance, uint64_t key);
+// Real peer address, instance and session key of a virtual address.
+bool ResolveAssociation(uint32_t virtual_address, uint32_t* peer_address, uint32_t* instance,
+                        uint64_t* key);
+
 class XSocket : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::Socket;
@@ -94,6 +134,8 @@ class XSocket : public XObject {
   ~XSocket();
 
   uint64_t native_handle() const { return native_handle_; }
+  // Winsock error code (WSAE*) of the last failed native call.
+  uint32_t last_wsa_error() const { return last_wsa_error_; }
   uint16_t bound_port() const { return bound_port_; }
 
   X_STATUS Initialize(AddressFamily af, Type type, Protocol proto);
@@ -105,6 +147,8 @@ class XSocket : public XObject {
   X_STATUS Connect(N_XSOCKADDR* name, int name_len);
   X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
   X_STATUS Listen(int backlog);
+  // The bound address in guest terms (port below 1024 as the guest bound it).
+  X_STATUS GetSockName(N_XSOCKADDR_IN* name);
   object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
   int Shutdown(int how);
 
@@ -130,6 +174,23 @@ class XSocket : public XObject {
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
   uint64_t native_handle_ = -1;
+  uint32_t last_wsa_error_ = 0;
+  // FIONBIO as the guest asked for it. The PS5 title sandbox refuses the
+  // native ioctl and fcntl, so non-blocking calls pass MSG_DONTWAIT instead.
+  bool non_blocking_ = false;
+  // The first datagrams each way are logged for system link diagnosis.
+  uint32_t logged_sends_ = 0;
+  uint32_t logged_receives_ = 0;
+  uint32_t logged_errors_ = 0;
+  uint64_t receive_calls_ = 0;
+  std::vector<uint8_t> receive_buffer_;
+  // Datagrams per address, summarised every few seconds for diagnosis.
+  std::map<uint32_t, uint32_t> sent_by_address_, received_by_address_;
+  uint64_t traffic_summary_ms_ = 0;
+  void CountTraffic(bool sent, uint32_t address);
+  int IoFlags(uint32_t flags) const;
+  // Records the native error of a call that returned `result`; passes it on.
+  int Track(int result);
 
   AddressFamily af_;    // Address family
   Type type_;           // Type (DGRAM/Stream/etc)

@@ -13,6 +13,7 @@
  *              role as a function dispatch table rather than a CPU emulator.
  */
 
+#include <cstring>
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -39,6 +40,38 @@ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
             ctx.last_indirect_target);
 }
 
+// Jump stubs the recompiler folded into neighbouring functions are only
+// entered through pointers: delegate thunks (lis r11,hi; addi r11,r11,lo;
+// mtctr r11; bctr) and branch tables (b target). Follow them to the function
+// they jump to.
+static PPCFunc* ResolveJumpStub(FunctionDispatcher* dispatcher, uint32_t address) {
+  for (int hops = 0; hops < 4; ++hops) {
+    const auto* code = dispatcher->memory()->TranslateVirtual<const uint8_t*>(address);
+    if (!code) {
+      return nullptr;
+    }
+    const auto word = [code](int index) {
+      uint32_t value;
+      std::memcpy(&value, code + index * 4, sizeof(value));
+      return rex::byte_swap(value);
+    };
+    const uint32_t lis = word(0), addi = word(1);
+    if ((lis & 0xFC000003) == 0x48000000) {
+      // b target: 26-bit signed displacement.
+      address += uint32_t(int32_t(lis << 6) >> 6);
+    } else if ((lis & 0xFFFF0000) == 0x3D600000 && (addi & 0xFFFF0000) == 0x396B0000 &&
+               word(2) == 0x7D6903A6 && word(3) == 0x4E800420) {
+      address = (lis << 16) + uint32_t(int32_t(int16_t(addi & 0xFFFF)));
+    } else {
+      return nullptr;
+    }
+    if (PPCFunc* func = dispatcher->GetFunction(address)) {
+      return func;
+    }
+  }
+  return nullptr;
+}
+
 PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
   FunctionDispatcher* dispatcher = GetBoundFunctionDispatcher();
   if (!dispatcher) {
@@ -46,6 +79,12 @@ PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
   }
 
   if (PPCFunc* func = dispatcher->GetFunction(guest_address)) {
+    return func;
+  }
+
+  if (PPCFunc* func = ResolveJumpStub(dispatcher, guest_address)) {
+    REXLOG_INFO("Resolved jump stub at {:08X}", guest_address);
+    dispatcher->SetFunction(guest_address, func);
     return func;
   }
 

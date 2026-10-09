@@ -87,7 +87,7 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
 
 typedef struct {
   rex::be<uint64_t> xuid;
-  rex::be<uint32_t> unk08;  // maybe zero?
+  rex::be<uint32_t> info_flags;  // XUSER_INFO_FLAG_*
   rex::be<uint32_t> signin_state;
   rex::be<uint32_t> unk10;  // ?
   rex::be<uint32_t> unk14;  // ?
@@ -111,6 +111,8 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   info->xuid = user_profile->xuid();
+  // XUSER_INFO_FLAG_LIVE_ENABLED: titles gate their online modes on it.
+  info->info_flags = user_profile->is_live_signed_in() ? 1 : 0;
   info->signin_state = user_profile->signin_state();
   rex::string::util_copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
   return X_E_SUCCESS;
@@ -430,8 +432,11 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
   }
 
-  // If we deny everything, games should hopefully not try to do stuff.
-  *out_value = 0;
+  // Offline, deny everything so games don't try online features. Signed in
+  // to "Live" (user_live_signed_in, used for system link play), grant them.
+  const bool live = REX_KERNEL_STATE()->user_profile()->is_live_signed_in();
+  REXKRNL_INFO("XamUserCheckPrivilege(user={}, privilege={}) -> {}", user_index, mask, live);
+  *out_value = live ? 1 : 0;
   return X_ERROR_SUCCESS;
 }
 
