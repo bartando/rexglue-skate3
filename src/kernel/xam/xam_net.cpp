@@ -44,6 +44,7 @@
 // NOTE: must be included last as it expects windows.h to already be included.
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
+#include <ws2tcpip.h>                    // inet_pton, socklen_t
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -478,8 +479,13 @@ uint32_t LocalAddress() {
     }
     // The source address of the route towards the LAN; no packet is sent.
     uint32_t result = INADDR_LOOPBACK;
+#if REX_PLATFORM_WIN32
+    // The title may ask before its own WSAStartup; the count is per process.
+    WSADATA wsa_data;
+    const bool wsa_started = WSAStartup(MAKEWORD(2, 2), &wsa_data) == 0;
+#endif
     auto probe_socket = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (probe_socket >= 0) {
+    if (rex::net::SocketHandle(probe_socket) != rex::net::kInvalidSocket) {
       sockaddr_in probe = {};
 #if REX_PLATFORM_MAC || REX_PLATFORM_PS5
       probe.sin_len = sizeof(probe);
@@ -495,6 +501,11 @@ uint32_t LocalAddress() {
       }
       rex::net::socket_close(probe_socket);
     }
+#if REX_PLATFORM_WIN32
+    if (wsa_started) {
+      WSACleanup();
+    }
+#endif
     REXKRNL_INFO("XNet: local address {}.{}.{}.{}", result >> 24, (result >> 16) & 0xFF,
                  (result >> 8) & 0xFF, result & 0xFF);
     return result;
