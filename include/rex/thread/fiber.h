@@ -70,6 +70,9 @@ struct Fiber {
   bool is_thread_fiber_ = false;
 
   static void Trampoline();
+#elif REX_PLATFORM_PS5
+  // Thread fibers only; see fiber_ps5.cpp.
+  bool is_thread_fiber_ = false;
 #endif
 };
 

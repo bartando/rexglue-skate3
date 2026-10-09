@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
@@ -38,17 +39,33 @@
 // #include "xenia/base/main_android.h"
 #endif
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
 #define ftruncate64 ftruncate
 #define mmap64 mmap
+#endif
+
+#if REX_PLATFORM_PS5
+#include <ps5platform/kernel.h>
 #endif
 
 namespace rex {
 namespace memory {
 
+#if REX_PLATFORM_PS5
+// Native-title direct arena, adapted from holdmysocks/mcla-recomp (GPL-3.0-or-later).
+namespace {
+constexpr FileMappingHandle kDirectMemoryHandle = 0x44495243;
+constexpr size_t kDirectAlignment = 0x200000;
+int64_t direct_start = -1;
+size_t direct_length = 0;
+std::atomic<uint64_t> protect_calls{0};
+std::atomic<uint64_t> protect_site_calls[kPs5ProtectSiteCount]{};
+}
+#endif
+
 namespace {
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
 void AlignHostPageRange(void*& base_address, size_t& length) {
   const uintptr_t page_mask = uintptr_t(page_size() - 1);
   const uintptr_t start = reinterpret_cast<uintptr_t>(base_address);
@@ -243,7 +260,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
       break;
   }
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
   if (base_address &&
       (allocation_type == AllocationType::kCommit ||
        allocation_type == AllocationType::kReserveCommit)) {
@@ -253,6 +270,10 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
     if (mprotect(protect_base, protect_length, static_cast<int>(prot_requested)) == 0) {
       return base_address;
     }
+#if REX_PLATFORM_PS5
+    // Never replace an existing guest alias with anonymous memory on failure.
+    return nullptr;
+#endif
   }
 #endif
 
@@ -294,7 +315,7 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
   switch (deallocation_type) {
     case DeallocationType::kDecommit: {
       // Decommit: remove access first, then release physical pages
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
       AlignHostPageRange(base_address, length);
 #endif
       if (mprotect(base_address, length, PROT_NONE) != 0) {
@@ -335,8 +356,13 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
   AlignHostPageRange(base_address, length);
+#endif
+#if REX_PLATFORM_PS5
+  protect_calls.fetch_add(1, std::memory_order_relaxed);
+  const int site = Ps5ProtectSite();
+  if (site >= 0 && site < kPs5ProtectSiteCount) protect_site_calls[site].fetch_add(1, std::memory_order_relaxed);
 #endif
   return mprotect(base_address, length, prot) == 0;
 }
@@ -407,6 +433,24 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
       return kFileMappingHandleInvalid;
   }
   oflag |= O_CREAT;
+#if REX_PLATFORM_PS5
+  // An installed title's flexible-memory budget cannot hold the 4.5 GiB arena.
+  // Use direct memory, which supports the same shared aliases without that budget.
+  if (direct_start >= 0 || length > SIZE_MAX - (kDirectAlignment - 1)) {
+    return kFileMappingHandleInvalid;
+  }
+  const size_t bytes = (length + kDirectAlignment - 1) & ~(kDirectAlignment - 1);
+  int64_t start = -1;
+  const int32_t status = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), bytes,
+      kDirectAlignment, PS5_KERNEL_DIRECT_TYPE_CPU, &start);
+  if (status != 0) {
+    std::fprintf(stderr, "PS5 guest arena allocation failed: bytes=0x%zx status=0x%x\n", bytes, unsigned(status));
+    return kFileMappingHandleInvalid;
+  }
+  direct_start = start;
+  direct_length = bytes;
+  return kDirectMemoryHandle;
+#else
   auto full_path = MakeShmName(path);
   int ret = shm_open(full_path.c_str(), oflag, 0777);
   if (ret < 0) {
@@ -418,12 +462,23 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
     return kFileMappingHandleInvalid;
   }
   return static_cast<FileMappingHandle>(ret);
+#endif  // PS5 direct-memory arena
 #endif
 }
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+#if REX_PLATFORM_PS5
+  if (handle == kDirectMemoryHandle) {
+    if (direct_start >= 0) {
+      const int32_t status = sceKernelReleaseDirectMemory(direct_start, direct_length);
+      if (status != 0) std::fprintf(stderr, "PS5 arena release failed: 0x%x\n", unsigned(status));
+      else { direct_start = -1; direct_length = 0; }
+    }
+    return;
+  }
+#endif
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
+#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_PS5
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
 #endif
@@ -447,6 +502,20 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
   }
 
   uint32_t prot = ToPosixProtectFlags(access);
+#if REX_PLATFORM_PS5
+  if (handle == kDirectMemoryHandle) {
+    if (direct_start < 0 || file_offset > direct_length || length > direct_length - file_offset) return nullptr;
+    void* address = base_address;
+    const int32_t status = sceKernelMapDirectMemory(&address, length, int(prot),
+        base_address ? PS5_KERNEL_MAP_FIXED : 0, direct_start + int64_t(file_offset), page);
+    if (status != 0) return nullptr;
+    if (base_address && address != base_address) {
+      sceKernelMunmap(address, length);
+      return nullptr;
+    }
+    return address;
+  }
+#endif
   void* result = mmap64(base_address, length, prot, flags, static_cast<int>(handle),
                         static_cast<off_t>(file_offset));
   if (result == MAP_FAILED) {
@@ -463,8 +532,34 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
 }
 
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
+#if REX_PLATFORM_PS5
+  if (handle == kDirectMemoryHandle) return sceKernelMunmap(base_address, length) == 0;
+#endif
   return munmap(base_address, length) == 0;
 }
+
+#if REX_PLATFORM_PS5
+void* ReserveFileMappingRange(FileMappingHandle handle, size_t length) {
+  if (handle != kDirectMemoryHandle) return nullptr;
+  void* address = reinterpret_cast<void*>(uintptr_t{0x1000000000ull});
+  const int32_t status = sceKernelReserveVirtualRange(&address, length, 0, PS5_KERNEL_DIRECT_ALIGNMENT);
+  if (status != 0) return nullptr;
+  const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+  if (start < 0x300000000ull && start + length > 0x200000000ull) {
+    sceKernelMunmap(address, length);
+    return nullptr;
+  }
+  return address;
+}
+bool ReleaseFileMappingRange(FileMappingHandle handle, void* address, size_t length) {
+  return handle == kDirectMemoryHandle && sceKernelMunmap(address, length) == 0;
+}
+int& Ps5ProtectSite() { static thread_local int site = 0; return site; }
+uint64_t Ps5ProtectCallCount() { return protect_calls.load(std::memory_order_relaxed); }
+uint64_t Ps5ProtectCallCount(int site) {
+  return site >= 0 && site < kPs5ProtectSiteCount ? protect_site_calls[site].load(std::memory_order_relaxed) : 0;
+}
+#endif
 
 }  // namespace memory
 }  // namespace rex

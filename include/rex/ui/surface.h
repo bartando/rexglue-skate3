@@ -35,12 +35,14 @@ class Surface {
     kTypeIndex_Win32Hwnd,
     // macOS.
     kTypeIndex_SDLMetalView,
+    kTypeIndex_Ps5Display,
   };
   using TypeFlags = uint32_t;
   enum : TypeFlags {
     kTypeFlag_AndroidNativeWindow = TypeFlags(1) << kTypeIndex_AndroidNativeWindow,
     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
     kTypeFlag_SDLMetalView = TypeFlags(1) << kTypeIndex_SDLMetalView,
+    kTypeFlag_Ps5Display = TypeFlags(1) << kTypeIndex_Ps5Display,
     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
   };
 

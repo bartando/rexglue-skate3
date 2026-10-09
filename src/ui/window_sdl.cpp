@@ -12,7 +12,11 @@
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#if REX_PLATFORM_PS5
+#include <rex/ui/surface_ps5.h>
+#else
 #include <rex/ui/surface_sdl.h>
+#endif
 #include <rex/ui/virtual_key.h>
 
 #include <SDL3/SDL_hints.h>
@@ -345,11 +349,13 @@ SDLWindow::~SDLWindow() {
   if (window_) {
     WindowMap().erase(SDL_GetWindowID(window_));
   }
+#if !REX_PLATFORM_PS5
   if (metal_view_) {
     SDL_Metal_DestroyView(metal_view_);
     metal_view_ = nullptr;
     metal_layer_ = nullptr;
   }
+#endif
   if (window_) {
     SDL_DestroyWindow(window_);
     window_ = nullptr;
@@ -437,6 +443,7 @@ bool SDLWindow::OpenImpl() {
 
   WindowMap().emplace(SDL_GetWindowID(window_), this);
 
+#if !REX_PLATFORM_PS5
   metal_view_ = SDL_Metal_CreateView(window_);
   if (!metal_view_) {
     REXLOG_ERROR("SDLWindow: Failed to create Metal view: {}", SDL_GetError());
@@ -455,6 +462,8 @@ bool SDLWindow::OpenImpl() {
     window_ = nullptr;
     return false;
   }
+
+#endif
 
   dpi_ = QueryDpi();
   SDL_ShowWindow(window_);
@@ -477,11 +486,13 @@ void SDLWindow::RequestCloseImpl() {
   OnBeforeClose(destruction_receiver);
   if (!destruction_receiver.IsWindowDestroyed()) {
     RemoveCursorAutoHideTimer();
+#if !REX_PLATFORM_PS5
     if (metal_view_) {
       SDL_Metal_DestroyView(metal_view_);
       metal_view_ = nullptr;
       metal_layer_ = nullptr;
     }
+#endif
     if (window_) {
       WindowMap().erase(SDL_GetWindowID(window_));
       SDL_DestroyWindow(window_);
@@ -541,10 +552,15 @@ void SDLWindow::FocusImpl() {
 }
 
 std::unique_ptr<Surface> SDLWindow::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
+#if REX_PLATFORM_PS5
+  if (allowed_types & Surface::kTypeFlag_Ps5Display) return std::make_unique<Ps5DisplaySurface>(1920, 1080);
+  return nullptr;
+#else
   if (!(allowed_types & Surface::kTypeFlag_SDLMetalView)) {
     return nullptr;
   }
   return std::make_unique<SDLMetalViewSurface>(window_, metal_view_, metal_layer_);
+#endif
 }
 
 void SDLWindow::RequestPaintImpl() {

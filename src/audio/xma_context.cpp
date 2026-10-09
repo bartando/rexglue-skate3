@@ -490,8 +490,13 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
 
   const auto cas_update = [&](size_t dword_idx, uint32_t mask, uint32_t value) {
     uint32_t* p = reinterpret_cast<uint32_t*>(context_ptr) + dword_idx;
+#if REX_PLATFORM_PS5
+    // The payload SDK's libc++ 18 has no atomic_ref. Keep identical CAS ordering.
+    uint32_t old_be = __atomic_load_n(p, __ATOMIC_RELAXED);
+#else
     std::atomic_ref<uint32_t> ref(*p);
     uint32_t old_be = ref.load(std::memory_order_relaxed);
+#endif
     while (true) {
       const uint32_t old_host = rex::byte_swap(old_be);
       const uint32_t new_host = (old_host & ~mask) | (value & mask);
@@ -501,8 +506,13 @@ void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
       }
       // release: decoded PCM written to the output ring must be visible
       // before the write offset advances.
+#if REX_PLATFORM_PS5
+      if (__atomic_compare_exchange_n(p, &old_be, new_be, true, __ATOMIC_RELEASE,
+                                      __ATOMIC_RELAXED)) {
+#else
       if (ref.compare_exchange_weak(old_be, new_be, std::memory_order_release,
                                     std::memory_order_relaxed)) {
+#endif
         return;
       }
     }

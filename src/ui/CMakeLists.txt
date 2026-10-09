@@ -69,6 +69,8 @@ if(WIN32)
         window_win.cpp
         windowed_app_context_win.cpp
     )
+elseif(PS5)
+    set(REXUI_PLATFORM_SOURCES window_sdl.cpp windowed_app_context_sdl.cpp)
 elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
         surface_sdl.cpp
@@ -158,7 +160,7 @@ if(WIN32)
         dxgi
         dxguid
     )
-elseif(APPLE)
+elseif(APPLE OR PS5)
     target_link_libraries(rexui PUBLIC SDL3::SDL3)
 else()
     find_package(PkgConfig REQUIRED)

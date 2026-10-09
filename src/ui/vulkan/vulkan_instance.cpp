@@ -29,6 +29,10 @@ REXCVAR_DEFINE_BOOL(vulkan_moltenvk_precise_math, true, "UI/Vulkan",
                     "infinity and signed zero behavior the Xenos shader emulation relies on")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+#if REX_PLATFORM_PS5
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance, const char*);
+#endif
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -65,11 +69,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   vulkan_instance->renderdoc_api_ = RenderDocAPI::CreateIfConnected();
 
-  // Load the loader library.
-
   Functions& ifn = vulkan_instance->functions_;
-
   bool functions_loaded = true;
+#if REX_PLATFORM_PS5
+  ifn.vkGetInstanceProcAddr = &::vk_icdGetInstanceProcAddr;
+  // vkDestroyInstance is loaded with a real instance below.
+#else
+  // Load the loader library.
   if (!vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)
 #if REX_PLATFORM_MAC
       && !vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoaderFallback)
@@ -88,6 +94,8 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     REXLOG_ERROR("Failed to get Vulkan loader function pointers");
     return nullptr;
   }
+
+#endif
 
   // Load global functions.
 
@@ -140,6 +148,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+#if REX_PLATFORM_PS5
+    // #3. The console has no window system; the driver presents to the
+    // display itself.
+    requested_extensions.emplace("VK_KHR_display", &vulkan_instance->extensions_.ext_KHR_display);
+#endif
 #ifdef VK_USE_PLATFORM_XCB_KHR
     // #6.
     requested_extensions.emplace("VK_KHR_xcb_surface",
@@ -391,6 +404,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                  vk::to_string(vk::Result(instance_create_result)));
     return nullptr;
   }
+
+#if REX_PLATFORM_PS5
+  if (!ifn.vkDestroyInstance) {
+    ifn.vkDestroyInstance = PFN_vkDestroyInstance(
+        ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, "vkDestroyInstance"));
+  }
+#endif
 
   // Load instance functions.
 

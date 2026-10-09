@@ -145,6 +145,33 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
                   size_t file_offset);
 bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length);
 
+#if REX_PLATFORM_PS5
+// Reserve an address range that views of the mapping will be placed in with
+// MapFileView, at an address of the kernel's choosing. How the reservation is
+// made depends on what backs the mapping (a shared object, or direct memory in
+// an installed title). Returns nullptr on failure.
+void* ReserveFileMappingRange(FileMappingHandle handle, size_t length);
+bool ReleaseFileMappingRange(FileMappingHandle handle, void* base_address, size_t length);
+// Number of Protect() calls made so far, for performance diagnosis.
+uint64_t Ps5ProtectCallCount();
+// The same, by who asked: 0 anything else, 1 enabling write-watches, 2 a watch
+// being triggered (a guest write fault or the GPU writing guest memory),
+// 3 reconciling host page protection with guest pages smaller than a host
+// page, 4 the access-violation callback's stale-protection recovery.
+inline constexpr int kPs5ProtectSiteCount = 5;
+uint64_t Ps5ProtectCallCount(int site);
+// Set (through Ps5ProtectSiteScope) by the code about to call Protect(). A
+// function, not an extern thread_local: that would make a weak reference to
+// the variable's initialisation function, which a title cannot link.
+int& Ps5ProtectSite();
+struct Ps5ProtectSiteScope {
+  explicit Ps5ProtectSiteScope(int site) : slot(Ps5ProtectSite()), previous(slot) { slot = site; }
+  ~Ps5ProtectSiteScope() { slot = previous; }
+  int& slot;
+  int previous;
+};
+#endif
+
 inline size_t hash_combine(size_t seed) {
   return seed;
 }

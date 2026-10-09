@@ -53,8 +53,10 @@ elseif(UNIX)
         dbg_posix.cpp
         dynlib_posix.cpp
         exception_handler_posix.cpp
+        exception_handler_ps5.cpp
         filesystem_posix.cpp
         fiber_posix.cpp
+        fiber_ps5.cpp
         mapped_memory_posix.cpp
         math_gcc.cpp
         memory_posix.cpp
@@ -77,7 +79,7 @@ target_include_directories(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
 )
 
-if(UNIX)
+if(UNIX AND NOT PS5)
     target_link_libraries(rexcore PRIVATE pthread dl)
     if(NOT APPLE)
         target_link_libraries(rexcore PRIVATE rt)

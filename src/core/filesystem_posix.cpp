@@ -36,7 +36,9 @@
 
 #if REX_PLATFORM_MAC
 #include <mach-o/dyld.h>
+#endif
 
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
 using off64_t = off_t;
 #define fseeko64 fseeko
 #define ftello64 ftello
@@ -64,7 +66,9 @@ std::filesystem::path to_path(const std::u16string_view source) {
 namespace filesystem {
 
 std::filesystem::path GetExecutablePath() {
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_PS5
+  return "/app0/eboot.bin";
+#elif REX_PLATFORM_MAC
   uint32_t size = PATH_MAX;
   std::vector<char> path(size);
   if (_NSGetExecutablePath(path.data(), &size) != 0) {

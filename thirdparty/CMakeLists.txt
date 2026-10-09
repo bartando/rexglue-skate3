@@ -63,7 +63,8 @@ if(REXGLUE_BUILD_TESTS)
 endif()
 
 foreach(submodule ${REQUIRED_SUBMODULES})
-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/.git")
+    if(NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}" OR
+       (NOT PS5 AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/.git"))
         message(FATAL_ERROR
             "Git submodule '${submodule}' is not initialized.\n"
             "Please run: git submodule update --init --recursive\n"
@@ -280,7 +281,7 @@ set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 
 # Disable unused subsystems
-if(APPLE)
+if(APPLE OR PS5)
     set(SDL_VIDEO ON CACHE BOOL "" FORCE)
 else()
     set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
@@ -313,7 +314,7 @@ set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux audio backends
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT PS5)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
     set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
@@ -322,6 +323,16 @@ if(UNIX AND NOT APPLE)
     set(SDL_PIPEWIRE_SHARED   ON  CACHE BOOL "" FORCE)
 endif()
 
+if(PS5)
+    # Headers declare these; the native-title support binds their implementations.
+    set(HAVE_GETRESUID 1 CACHE INTERNAL "" FORCE)
+    set(HAVE_GETRESGID 1 CACHE INTERNAL "" FORCE)
+    set(SDL_OFFSCREEN ON CACHE BOOL "" FORCE)
+    set(SDL_AUDIO OFF CACHE BOOL "" FORCE)
+    set(SDL_KMSDRM OFF CACHE BOOL "" FORCE)
+    set(SDL_X11 OFF CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(sdl3)
 
 #=============================================================================

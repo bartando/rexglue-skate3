@@ -45,7 +45,7 @@
 #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
 #include <winsock2.h>                    // NOLINT(build/include_order)
 #include <ws2tcpip.h>                    // inet_pton, socklen_t
-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>

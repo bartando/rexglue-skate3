@@ -9,7 +9,7 @@
 
 // big endian architectures need #define __BYTE_ORDER __BIG_ENDIAN
 #ifndef _MSC_VER
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__PROSPERO__)
 #include <machine/endian.h>
 #ifndef __BYTE_ORDER
 #define __BYTE_ORDER BYTE_ORDER

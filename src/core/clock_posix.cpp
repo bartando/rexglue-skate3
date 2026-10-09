@@ -10,13 +10,13 @@
 #include <rex/chrono/clock.h>
 #include <rex/platform.h>
 
-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_PS5, "This file is POSIX-only");
 
 #include <sys/time.h>
 
 namespace rex::chrono {
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
 constexpr clockid_t kHostClock = CLOCK_MONOTONIC;
 #else
 constexpr clockid_t kHostClock = CLOCK_MONOTONIC_RAW;

@@ -30,6 +30,9 @@
 #include <spdlog/sinks/msvc_sink.h>
 #else
 #include <spdlog/sinks/stdout_sinks.h>
+#if REX_PLATFORM_PS5
+#include <spdlog/sinks/null_sink.h>
+#endif
 #endif
 
 REXCVAR_DEFINE_STRING(log_level, "info", "Log",
@@ -173,6 +176,9 @@ void InitLoggingEarly() {
 
 #if REX_PLATFORM_WIN32
   auto sink = std::make_shared<spdlog::sinks::msvc_sink_mt>();
+#elif REX_PLATFORM_PS5
+  // Native titles have no usable stdout. The host installs a descriptor sink.
+  auto sink = std::make_shared<spdlog::sinks::null_sink_mt>();
 #else
   auto sink = std::make_shared<spdlog::sinks::stdout_sink_mt>();
 #endif

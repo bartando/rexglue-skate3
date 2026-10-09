@@ -20,7 +20,7 @@
 #include <rex/memory/mapped_memory.h>
 #include <rex/platform.h>
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_PS5
 using off64_t = off_t;
 #define stat64 stat
 #define fstat64 fstat

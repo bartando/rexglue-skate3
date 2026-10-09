@@ -14,7 +14,13 @@
 
 #include <rex/platform/dynlib.h>
 
+#if REX_PLATFORM_PS5
+#define __linux__ 1
 #include <renderdoc_app.h>
+#undef __linux__
+#else
+#include <renderdoc_app.h>
+#endif
 
 namespace rex {
 namespace ui {

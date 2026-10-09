@@ -174,6 +174,10 @@ bool Memory::Initialize() {
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
   mapping_base_ = 0;
+#if REX_PLATFORM_PS5
+  // Reserve first, outside RADV's GPU VA window, then map only into owned space.
+  if (!MapViews(nullptr)) mapping_base_ = views_.all_views[0];
+#else
   for (size_t n = 32; n < 64; n++) {
     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
     if (!MapViews(mapping_base)) {
@@ -181,6 +185,7 @@ bool Memory::Initialize() {
       break;
     }
   }
+#endif
 #if REX_PLATFORM_MAC
   if (!mapping_base_) {
     if (!MapViews(nullptr)) {
@@ -352,7 +357,11 @@ constexpr size_t kGuestMappingLength = 0x120000000ull;
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
 
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_PS5
+  void* reservation = rex::memory::ReserveFileMappingRange(mapping_, kGuestMappingLength);
+  if (!reservation) return 1;
+  mapping_base = reinterpret_cast<uint8_t*>(reservation);
+#elif REX_PLATFORM_MAC
   // macOS doesn't provide MAP_FIXED_NOREPLACE. Direct MAP_FIXED probing can
   // overwrite unrelated host mappings, so first reserve the entire range as a
   // hint and only proceed with a fixed base we own.
@@ -380,7 +389,10 @@ int Memory::MapViews(uint8_t* mapping_base) {
         rex::memory::PageAccess::kReadWrite, map_info[n].target_address & granularity_mask));
     if (!views_.all_views[n]) {
       // Failed, so bail and try again.
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_PS5
+      rex::memory::ReleaseFileMappingRange(mapping_, mapping_base, kGuestMappingLength);
+      std::fill(std::begin(views_.all_views), std::end(views_.all_views), nullptr);
+#elif REX_PLATFORM_MAC
       munmap(mapping_base, kGuestMappingLength);
       std::fill(std::begin(views_.all_views), std::end(views_.all_views), nullptr);
 #else

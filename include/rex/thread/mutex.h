@@ -13,7 +13,39 @@
 
 #include <mutex>
 
+#include <rex/platform.h>
+
+#if REX_PLATFORM_PS5
+#include <immintrin.h>
+#endif
+
 namespace rex::thread {
+
+#if REX_PLATFORM_PS5
+// Taking the global lock on PS5: try for a short while before sleeping on it.
+//
+// The lock is held briefly but taken constantly, by the GPU command thread,
+// the guest's main thread, the audio thread and the vsync thread. A profile of
+// the game on the console showed the GPU thread blocked on it for over 40% of
+// its time, far more than the work done under the lock accounts for: a thread
+// that finds it taken sleeps in the kernel, and getting it running again
+// costs much more than the wait was worth. Spinning covers the common case,
+// where the holder is a few tens of microseconds from releasing it.
+inline std::unique_lock<std::recursive_mutex> AcquireGlobalLockSpinning(
+    std::recursive_mutex& mutex) {
+  std::unique_lock<std::recursive_mutex> lock(mutex, std::try_to_lock);
+  for (int attempt = 0; !lock.owns_lock() && attempt < 4000; ++attempt) {
+    for (int pause = 0; pause < 24; ++pause) {
+      _mm_pause();
+    }
+    lock.try_lock();
+  }
+  if (!lock.owns_lock()) {
+    lock.lock();
+  }
+  return lock;
+}
+#endif
 
 // The global critical region mutex singleton.
 // This must guard any operation that may suspend threads or be sensitive to
@@ -62,12 +94,20 @@ class global_critical_region {
   // to keep an instance of global_critical_region near the members requiring
   // it to keep things readable.
   static std::unique_lock<std::recursive_mutex> AcquireDirect() {
+#if REX_PLATFORM_PS5
+    return AcquireGlobalLockSpinning(mutex());
+#else
     return std::unique_lock<std::recursive_mutex>(mutex());
+#endif
   }
 
   // Acquires a lock on the global critical section.
   inline std::unique_lock<std::recursive_mutex> Acquire() {
+#if REX_PLATFORM_PS5
+    return AcquireGlobalLockSpinning(mutex());
+#else
     return std::unique_lock<std::recursive_mutex>(mutex());
+#endif
   }
 
   // Acquires a deferred lock on the global critical section.
