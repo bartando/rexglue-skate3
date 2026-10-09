@@ -240,6 +240,8 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
 
   native_handle_ = socket(af, type, proto);
   if (native_handle_ == -1) {
+    REXSYS_WARN("socket({}, {}, {}) failed: errno {}", uint32_t(af), uint32_t(type), uint32_t(proto),
+                errno);
     return X_STATUS_UNSUCCESSFUL;
   }
 
