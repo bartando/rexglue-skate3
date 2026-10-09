@@ -752,6 +752,20 @@ bool ReXApp::SetupPresentation() {
           }
         });
 
+        fullscreen_hint_ = std::make_unique<ui::FullscreenHintDialog>(imgui_drawer_.get());
+        auto toggle_fullscreen = [this] {
+          window_->SetFullscreen(!window_->IsFullscreen());
+          if (window_->IsFullscreen()) {
+            fullscreen_hint_->Show();
+          }
+        };
+        rex::ui::RegisterBind("bind_fullscreen", "F11", "Toggle fullscreen", toggle_fullscreen);
+        rex::ui::RegisterBind("bind_fullscreen_alt", "Alt+Return", "Toggle fullscreen",
+                              toggle_fullscreen);
+        if (window_->IsFullscreen()) {
+          fullscreen_hint_->Show();
+        }
+
         OnCreateDialogs(imgui_drawer_.get());
       }
     }
@@ -848,11 +862,14 @@ void ReXApp::OnDestroy() {
   rex::ui::UnregisterBind("bind_debug_overlay");
   rex::ui::UnregisterBind("bind_console");
   rex::ui::UnregisterBind("bind_settings");
+  rex::ui::UnregisterBind("bind_fullscreen");
+  rex::ui::UnregisterBind("bind_fullscreen_alt");
   // The show_fps_counter callback captures `this` - drop it before teardown.
   rex::cvar::UnregisterChangeCallbacks("show_fps_counter");
 
   // ImGui cleanup (reverse of setup)
   fps_overlay_.reset();
+  fullscreen_hint_.reset();
   settings_overlay_.reset();
   console_overlay_.reset();
   debug_overlay_.reset();

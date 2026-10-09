@@ -258,6 +258,10 @@ void UnregisterBind(std::string_view name) {
 }
 
 bool ProcessKeyEvent(KeyEvent& e) {
+  // Alt+F4 must reach the OS as the close shortcut, even with a plain F4 bind.
+  if (e.virtual_key() == VirtualKey::kF4 && e.is_alt_pressed()) {
+    return false;
+  }
   std::lock_guard lock(g_binds_mutex);
   for (auto& entry : g_binds) {
     if (!entry.callback)

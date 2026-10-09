@@ -23,6 +23,7 @@ set(REXUI_OVERLAY_SOURCES
     overlay/debug_overlay.cpp
     overlay/console_overlay.cpp
     overlay/fps_overlay.cpp
+    overlay/fullscreen_hint.cpp
     overlay/acquire_wizard_overlay.cpp
     overlay/install_wizard_overlay.cpp
     overlay/wizard_screen.cpp

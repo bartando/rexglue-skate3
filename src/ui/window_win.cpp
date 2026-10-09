@@ -995,6 +995,9 @@ bool Win32Window::HandleKeyboard(UINT message, WPARAM wParam, LPARAM lParam,
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
       OnKeyDown(e, destruction_receiver);
+      if (!destruction_receiver.IsWindowDestroyed()) {
+        last_sys_key_down_handled_ = message == WM_SYSKEYDOWN && e.is_handled();
+      }
       break;
     case WM_KEYUP:
     case WM_SYSKEYUP:
@@ -1003,6 +1006,10 @@ bool Win32Window::HandleKeyboard(UINT message, WPARAM wParam, LPARAM lParam,
     case WM_CHAR:
     case WM_SYSCHAR:
       OnKeyChar(e, destruction_receiver);
+      if (message == WM_SYSCHAR && !destruction_receiver.IsWindowDestroyed() &&
+          last_sys_key_down_handled_) {
+        e.set_handled(true);
+      }
       break;
     default:
       break;

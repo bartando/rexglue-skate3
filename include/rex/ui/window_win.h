@@ -116,6 +116,10 @@ class Win32Window : public Window {
   bool batched_size_update_contained_wm_size_ = false;
   bool batched_size_update_contained_wm_paint_ = false;
 
+  // An Alt chord consumed as a bind still produces a WM_SYSCHAR, which
+  // DefWindowProc answers with the "no such menu" beep.
+  bool last_sys_key_down_handled_ = false;
+
   uint32_t pre_fullscreen_dpi_;
   WINDOWPLACEMENT pre_fullscreen_placement_;
   // The client area part of pre_fullscreen_placement_.rcNormalPosition, saved
