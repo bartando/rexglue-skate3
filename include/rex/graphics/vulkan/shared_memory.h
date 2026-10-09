@@ -84,6 +84,9 @@ class VulkanSharedMemory : public SharedMemory {
   };
   std::vector<StagedCopy> staged_copies_;
   std::vector<std::pair<uint32_t, const uint8_t*>> staged_pages_;
+  // Cached copy of the staged data for the hoisting diff and shadow when the
+  // upload buffers are write-combined.
+  std::vector<uint8_t> staged_scratch_;
 
   // Created temporarily, only for downloading.
   VkBuffer trace_download_buffer_ = VK_NULL_HANDLE;

@@ -356,6 +356,17 @@ bool VulkanSharedMemory::UploadRanges(
   bool successful = true;
   staged_copies_.clear();
   staged_pages_.clear();
+  const bool hoist_enabled = REXCVAR_GET(vulkan_hoist_shared_memory_uploads);
+  size_t staged_scratch_used = 0;
+  if (hoist_enabled) {
+    size_t upload_page_count = 0;
+    for (auto upload_range : upload_page_ranges) {
+      upload_page_count += upload_range.second;
+    }
+    if (staged_scratch_.size() < (upload_page_count << page_size_log2())) {
+      staged_scratch_.resize(upload_page_count << page_size_log2());
+    }
+  }
   for (auto upload_range : upload_page_ranges) {
     uint32_t upload_range_start = upload_range.first;
     uint32_t upload_range_length = upload_range.second;
@@ -373,9 +384,21 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      const uint8_t* guest_data =
+          memory().TranslatePhysical(upload_range_start << page_size_log2());
+      // The hoisting diff and shadow read the staged data back, which must not
+      // come from write-combined memory, and must not come from guest memory
+      // either since the guest may already be writing to it again.
+      const uint8_t* staged_data = upload_buffer_mapping;
+      if (hoist_enabled && !upload_buffer_pool_->IsMemoryHostCached()) {
+        uint8_t* scratch = staged_scratch_.data() + staged_scratch_used;
+        std::memcpy(scratch, guest_data, upload_buffer_size);
+        std::memcpy(upload_buffer_mapping, scratch, upload_buffer_size);
+        staged_scratch_used += upload_buffer_size;
+        staged_data = scratch;
+      } else {
+        std::memcpy(upload_buffer_mapping, guest_data, upload_buffer_size);
+      }
       staged_copies_.push_back(
           {upload_buffer,
            {upload_buffer_offset, VkDeviceSize(upload_range_start << page_size_log2()),
@@ -383,7 +406,7 @@ bool VulkanSharedMemory::UploadRanges(
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       for (uint32_t i = 0; i < upload_buffer_pages; ++i) {
         staged_pages_.emplace_back(upload_range_start + i,
-                                   upload_buffer_mapping + (size_t(i) << page_size_log2()));
+                                   staged_data + (size_t(i) << page_size_log2()));
       }
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;
@@ -396,8 +419,7 @@ bool VulkanSharedMemory::UploadRanges(
     return successful;
   }
 
-  const bool hoist = REXCVAR_GET(vulkan_hoist_shared_memory_uploads) &&
-                     !UploadChangesAccessedBytes(staged_pages_);
+  const bool hoist = hoist_enabled && !UploadChangesAccessedBytes(staged_pages_);
   NoteUploadedPages(staged_pages_, hoist);
   if (!hoist) {
     // Attribute the GPU time of the upload copies (and the barriers around

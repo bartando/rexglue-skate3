@@ -27,6 +27,10 @@ class VulkanUploadBufferPool : public GraphicsUploadBufferPool {
   uint8_t* RequestPartial(uint64_t submission_index, size_t size, size_t alignment,
                           VkBuffer& buffer_out, VkDeviceSize& offset_out, VkDeviceSize& size_out);
 
+  // False until the first page is created, and for write-combined memory,
+  // which is very slow to read back on the CPU.
+  bool IsMemoryHostCached() const;
+
  protected:
   Page* CreatePageImplementation() override;
 

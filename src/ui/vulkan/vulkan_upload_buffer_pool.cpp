@@ -46,6 +46,11 @@ uint8_t* VulkanUploadBufferPool::Request(uint64_t submission_index, size_t size,
   return reinterpret_cast<uint8_t*>(page->mapping_) + offset;
 }
 
+bool VulkanUploadBufferPool::IsMemoryHostCached() const {
+  return memory_type_ < kMemoryTypeUnavailable &&
+         (vulkan_device_->memory_types().host_cached & (uint32_t(1) << memory_type_));
+}
+
 uint8_t* VulkanUploadBufferPool::RequestPartial(uint64_t submission_index, size_t size,
                                                 size_t alignment, VkBuffer& buffer_out,
                                                 VkDeviceSize& offset_out, VkDeviceSize& size_out) {
@@ -123,6 +128,8 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
         }
       }
     }
+    REXLOG_INFO("Vulkan upload buffers: memory type {}, {}", memory_type_,
+                IsMemoryHostCached() ? "host-cached" : "uncached (write-combined)");
   }
 
   VkMemoryAllocateInfo memory_allocate_info;
