@@ -730,5 +730,12 @@ if(WIN32)
     target_link_libraries(libavcodec PRIVATE bcrypt)
 endif()
 
+# FFmpeg's config.h dispatcher has no PS5 branch. Every FFmpeg source includes
+# "config.h" from a subdirectory, so this directory's copy is found first.
+if(PS5)
+    target_include_directories(libavutil BEFORE PRIVATE "${FFMPEG_OVERLAY_SRC_DIR}/ps5")
+    target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_OVERLAY_SRC_DIR}/ps5")
+endif()
+
 # IDE folder organization
 set_target_properties(libavutil libavcodec PROPERTIES FOLDER "FFmpeg")
