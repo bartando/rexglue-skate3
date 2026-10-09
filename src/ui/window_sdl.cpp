@@ -553,7 +553,12 @@ void SDLWindow::FocusImpl() {
 
 std::unique_ptr<Surface> SDLWindow::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
 #if REX_PLATFORM_PS5
-  if (allowed_types & Surface::kTypeFlag_Ps5Display) return std::make_unique<Ps5DisplaySurface>(1920, 1080);
+  if (allowed_types & Surface::kTypeFlag_Ps5Display) {
+    // The display mode is chosen by size, so the window's size picks it.
+    const uint32_t width = GetDesiredLogicalWidth();
+    const uint32_t height = GetDesiredLogicalHeight();
+    return std::make_unique<Ps5DisplaySurface>(width ? width : 1920, height ? height : 1080);
+  }
   return nullptr;
 #else
   if (!(allowed_types & Surface::kTypeFlag_SDLMetalView)) {
