@@ -119,8 +119,11 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include"
         "${REXGLUE_FIDELITYFX_SOURCE_DIR}/ffx-api/include"
     )
-    target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
+# FSR 1 and CAS use the presenter's precompiled shaders and reimplemented
+# constants; only the temporal runtime (FSR 2/3) needs the SDK itself. Public
+# because it changes the layout of the presenter classes.
+target_compile_definitions(rexui PUBLIC REX_HAS_FIDELITYFX_SDK=1)
 
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
 if(TARGET amd_fidelityfx_vk)
