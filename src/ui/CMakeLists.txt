@@ -147,7 +147,7 @@ endif()
 if(WIN32)
     target_link_libraries(rexui PUBLIC
         dwmapi
-        Shcore
+        shcore
         # The backend-agnostic Presenter drives a DXGI UI tick thread on Windows
         # (display-refresh sync), so DXGI is required regardless of the graphics
         # backend selected (e.g. Vulkan-on-Windows builds with D3D12 disabled).
