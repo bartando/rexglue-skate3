@@ -1622,7 +1622,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  if (!WriteFenceOnGpuTimeline(address, data_value)) {
+    memory::store(memory_->TranslatePhysical(address), data_value);
+  }
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }

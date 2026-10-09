@@ -428,6 +428,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                                       args.set, write_count, writes);
       } break;
 
+      case Command::kVkFillBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkFillBuffer*>(stream);
+        dfn.vkCmdFillBuffer(command_buffer, args.buffer, args.offset, args.size, args.data);
+      } break;
+
       case Command::kVkResetQueryPool: {
         auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
         dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,

@@ -311,6 +311,15 @@ class DeferredCommandBuffer {
   void CmdVkBeginRendering(const VkRenderingInfo* rendering_info);
   void CmdVkEndRendering() { WriteCommand(Command::kVkEndRendering, 0); }
 
+  void CmdVkFillBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
+    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
+        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
+    args.buffer = buffer;
+    args.offset = offset;
+    args.size = size;
+    args.data = data;
+  }
+
   void CmdVkResetQueryPool(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count) {
     auto& args = *reinterpret_cast<ArgsVkResetQueryPool*>(
         WriteCommand(Command::kVkResetQueryPool, sizeof(ArgsVkResetQueryPool)));
@@ -451,6 +460,7 @@ class DeferredCommandBuffer {
     kVkEndRenderPass,
     kVkBeginRendering,
     kVkEndRendering,
+    kVkFillBuffer,
     kVkPipelineBarrier,
     kVkPushConstants,
     kVkPushUniformBufferDescriptorSet,
@@ -618,6 +628,13 @@ class DeferredCommandBuffer {
   struct ArgsVkEndQuery {
     VkQueryPool query_pool;
     uint32_t query;
+  };
+
+  struct ArgsVkFillBuffer {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+    uint32_t data;
   };
 
   struct ArgsVkResetQueryPool {

@@ -132,6 +132,7 @@ class SharedMemory {
   // Advances the frame index that hot-page detection counts streaks in. In
   // zero-copy mode also fires the watches on hot pages (see zero_copy_).
   void OnFrameEnd();
+  bool zero_copy() const { return zero_copy_; }
 
  protected:
   // Whether moving an upload ahead of earlier work in the window could change

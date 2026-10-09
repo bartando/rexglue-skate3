@@ -205,6 +205,11 @@ class CommandProcessor {
   bool ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+  // Writes an EVENT_WRITE_SHD fence value once the host GPU has finished the
+  // work before it, instead of when the packet is processed. Needed where the
+  // GPU reads guest memory directly: the guest reuses buffers as soon as it
+  // sees the fence. Returns false if the backend writes it immediately.
+  virtual bool WriteFenceOnGpuTimeline(uint32_t address, uint32_t value) { return false; }
   bool ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count);
   bool ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* reader, uint32_t packet,

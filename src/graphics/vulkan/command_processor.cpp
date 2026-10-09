@@ -9961,6 +9961,32 @@ void VulkanCommandProcessor::ShutdownGpuTimestampResources() {
   }
 }
 
+bool VulkanCommandProcessor::WriteFenceOnGpuTimeline(uint32_t address, uint32_t value) {
+  if (!shared_memory_ || !shared_memory_->zero_copy() || !BeginSubmission(true)) {
+    return false;
+  }
+  EndRenderPass();
+  // Everything before the fence must be done with guest memory first.
+  VkMemoryBarrier before = {};
+  before.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  before.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  before.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &before, 0,
+                                                nullptr, 0, nullptr);
+  // The guest stores the swapped value as raw bytes; fill writes the same.
+  deferred_command_buffer_.CmdVkFillBuffer(shared_memory_->buffer(), address & 0x1FFFFFFF, 4,
+                                           value);
+  VkMemoryBarrier after = {};
+  after.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  after.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+  deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &after, 0,
+                                                nullptr, 0, nullptr);
+  return true;
+}
+
 void VulkanCommandProcessor::FrameTimerBeginFrame() {
   if (!REXCVAR_GET(vulkan_gpu_frame_timer)) {
     return;

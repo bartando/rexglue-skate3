@@ -904,6 +904,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint32_t submission_timer_next_slot_ = 0;
   uint64_t submission_timer_work_ns_ = 0;
   uint64_t submission_timer_count_ = 0;
+  bool WriteFenceOnGpuTimeline(uint32_t address, uint32_t value) override;
   void FrameTimerBeginFrame();
   void FrameTimerEndFrame();
   uint32_t SubmissionTimerBegin(VkCommandBuffer command_buffer);
