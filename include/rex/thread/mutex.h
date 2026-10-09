@@ -17,6 +17,7 @@
 
 #if REX_PLATFORM_PS5
 #include <immintrin.h>
+#include <x86intrin.h>
 #endif
 
 namespace rex::thread {
@@ -31,9 +32,20 @@ namespace rex::thread {
 // that finds it taken sleeps in the kernel, and getting it running again
 // costs much more than the wait was worth. Spinning covers the common case,
 // where the holder is a few tens of microseconds from releasing it.
+//
+// Contended acquisitions on the calling thread, for the GPU CPU profile: TSC
+// ticks spent waiting, how many waited, and how many gave up and slept.
+inline thread_local uint64_t global_lock_wait_ticks = 0;
+inline thread_local uint64_t global_lock_waits = 0;
+inline thread_local uint64_t global_lock_sleeps = 0;
+
 inline std::unique_lock<std::recursive_mutex> AcquireGlobalLockSpinning(
     std::recursive_mutex& mutex) {
   std::unique_lock<std::recursive_mutex> lock(mutex, std::try_to_lock);
+  if (lock.owns_lock()) {
+    return lock;
+  }
+  const uint64_t wait_start = __rdtsc();
   for (int attempt = 0; !lock.owns_lock() && attempt < 4000; ++attempt) {
     for (int pause = 0; pause < 24; ++pause) {
       _mm_pause();
@@ -42,7 +54,10 @@ inline std::unique_lock<std::recursive_mutex> AcquireGlobalLockSpinning(
   }
   if (!lock.owns_lock()) {
     lock.lock();
+    ++global_lock_sleeps;
   }
+  global_lock_wait_ticks += __rdtsc() - wait_start;
+  ++global_lock_waits;
   return lock;
 }
 #endif

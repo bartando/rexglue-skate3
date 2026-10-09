@@ -619,6 +619,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
       size_t host_page_size = rex::memory::page_size();
       uintptr_t page_base =
           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+#if REX_PLATFORM_PS5
+      rex::memory::Ps5ProtectSiteScope protect_site(4);
+#endif
       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
                                rex::memory::PageAccess::kReadWrite, nullptr)) {
         REXSYS_WARN(
@@ -1527,6 +1530,9 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
       (((page_count << page_size_shift_) % rex::memory::page_size() == 0) &&
        ((start_page_number << page_size_shift_) % rex::memory::page_size() == 0))) {
     memory::PageAccess old_protect_access;
+#if REX_PLATFORM_PS5
+    rex::memory::Ps5ProtectSiteScope protect_site(3);
+#endif
     if (!rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
                               page_count << page_size_shift_, ToPageAccess(protect),
                               old_protect ? &old_protect_access : nullptr)) {
@@ -1911,6 +1917,9 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
   auto global_lock = global_critical_region_.Acquire();
+#if REX_PLATFORM_PS5
+  rex::memory::Ps5ProtectSiteScope protect_site(1);
+#endif
   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
     // Check if need to enable callbacks for the page and raise its protection.
     //
@@ -2102,6 +2111,9 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
 
   // Unprotect ranges that need unprotection.
   if (unprotect) {
+#if REX_PLATFORM_PS5
+    rex::memory::Ps5ProtectSiteScope protect_site(2);
+#endif
     uint8_t* protect_base = membase_ + heap_base_;
     uint32_t unprotect_system_page_first = UINT32_MAX;
     for (uint32_t i = system_page_first; i <= system_page_last; ++i) {

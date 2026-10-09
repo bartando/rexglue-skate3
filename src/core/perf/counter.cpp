@@ -309,6 +309,11 @@ constexpr const char* kCounterNames[] = {
     "texture_cache_misses",
     "pipeline_cache_hits",
     "pipeline_cache_misses",
+    "cpu_memory_protect_us",
+    "cpu_shared_memory_request_us",
+    "cpu_shared_memory_upload_us",
+    "cpu_shared_memory_upload_pages",
+    "cpu_shared_memory_make_valid_us",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -497,6 +502,11 @@ constexpr bool kIsGauge[] = {
     false,  // kTextureCacheMisses
     false,  // kPipelineCacheHits
     false,  // kPipelineCacheMisses
+    false,  // kCpuMemoryProtectUs
+    false,  // kCpuSharedMemoryRequestUs
+    false,  // kCpuSharedMemoryUploadUs
+    false,  // kCpuSharedMemoryUploadPages
+    false,  // kCpuSharedMemoryMakeValidUs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

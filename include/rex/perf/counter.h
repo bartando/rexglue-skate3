@@ -361,6 +361,13 @@ enum class CounterId : uint16_t {
   kPipelineCacheHits,
   kPipelineCacheMisses,
 
+  // GPU-thread detail for the CPU profile.
+  kCpuMemoryProtectUs,
+  kCpuSharedMemoryRequestUs,
+  kCpuSharedMemoryUploadUs,
+  kCpuSharedMemoryUploadPages,
+  kCpuSharedMemoryMakeValidUs,
+
   kCount  // sentinel -- must be last
 };
 
@@ -392,6 +399,40 @@ inline void Reset() {
   for (Slot& slot : slots) {
     slot.ticks = 0;
     slot.count = 0;
+  }
+}
+
+// The thread that owns the profile (the GPU command thread). OwnerScope
+// records only there, so code other threads also run keeps slots single-writer.
+inline thread_local bool owner_thread = false;
+
+class OwnerScope {
+ public:
+  explicit OwnerScope(CounterId id)
+      : id_(id),
+        start_(owner_thread && enabled.load(std::memory_order_relaxed) ? Ticks() : 0) {}
+  ~OwnerScope() {
+    if (start_) {
+      Slot& slot = slots[size_t(id_)];
+      slot.ticks += Ticks() - start_;
+      ++slot.count;
+    }
+  }
+  OwnerScope(const OwnerScope&) = delete;
+  OwnerScope& operator=(const OwnerScope&) = delete;
+
+ private:
+  CounterId id_;
+  uint64_t start_;
+};
+
+// Shared-memory pages uploaded this frame (owner thread, profile armed),
+// consumed at frame end to measure how contiguous and repeated uploads are.
+inline std::vector<uint32_t> frame_uploaded_pages;
+
+inline void AddOwnerCount(CounterId id, uint64_t count) {
+  if (owner_thread && enabled.load(std::memory_order_relaxed)) {
+    slots[size_t(id)].count += count;
   }
 }
 

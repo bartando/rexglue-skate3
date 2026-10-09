@@ -20,6 +20,7 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/memory.h>
 
 REXCVAR_DEFINE_BOOL(
@@ -520,6 +521,7 @@ bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
 }
 
 void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu) {
+  rex::perf::cpu_profile::OwnerScope profile(rex::perf::CounterId::kCpuSharedMemoryMakeValidUs);
   if (length == 0 || start >= kBufferSize) {
     return;
   }
@@ -902,8 +904,64 @@ bool SharedMemory::RequestRangesUntracked(const std::pair<uint32_t, uint32_t>* r
   if (upload_ranges_.empty()) {
     return true;
   }
+  WidenUploadRanges();
 
   return UploadRanges(upload_ranges_);
+}
+
+void SharedMemory::WidenUploadRanges() {
+  if (cpu_invalidation_widen_pages_ <= 1) {
+    return;
+  }
+  const uint32_t window_mask = cpu_invalidation_widen_pages_ - 1;
+  const uint32_t page_last_in_buffer = (kBufferSize >> page_size_log2_) - 1;
+  // Read without the global lock, like the all-valid fast path: a page
+  // validated concurrently is only uploaded once more.
+  const uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
+  memory::BaseHeap* physical_heap = memory().GetPhysicalHeap();
+  auto widenable = [&](uint32_t page) {
+    if (valid_flags && (valid_flags[page >> 6] & (uint64_t(1) << (page & 63)))) {
+      return false;
+    }
+    // Uncommitted guest memory is inaccessible on the host; never read it.
+    const uint32_t address = page << page_size_log2_;
+    return physical_heap->QueryRangeAccess(address,
+                                           address + (uint32_t(1) << page_size_log2_) - 1) !=
+           rex::memory::PageAccess::kNoAccess;
+  };
+  widened_upload_ranges_.clear();
+  for (auto [first, count] : upload_ranges_) {
+    uint32_t last = first + count - 1;
+    const uint32_t window_first = first & ~window_mask;
+    const uint32_t window_last = std::min(last | window_mask, page_last_in_buffer);
+    while (first > window_first && widenable(first - 1)) {
+      --first;
+    }
+    while (last < window_last && widenable(last + 1)) {
+      ++last;
+    }
+    widened_upload_ranges_.emplace_back(first, last + 1 - first);
+  }
+  std::sort(widened_upload_ranges_.begin(), widened_upload_ranges_.end());
+  size_t merged = 0;
+  for (size_t i = 1; i < widened_upload_ranges_.size(); ++i) {
+    auto& previous = widened_upload_ranges_[merged];
+    const auto& range = widened_upload_ranges_[i];
+    if (range.first <= previous.first + previous.second) {
+      previous.second =
+          std::max(previous.first + previous.second, range.first + range.second) - previous.first;
+    } else {
+      widened_upload_ranges_[++merged] = range;
+    }
+  }
+  widened_upload_ranges_.resize(merged + 1);
+  for (const auto& range : widened_upload_ranges_) {
+    if (!EnsureHostGpuMemoryAllocated(range.first << page_size_log2_,
+                                      range.second << page_size_log2_)) {
+      return;  // Keep the unwidened ranges.
+    }
+  }
+  upload_ranges_.swap(widened_upload_ranges_);
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
@@ -922,6 +980,7 @@ bool SharedMemory::RequestRangeUntracked(uint32_t start, uint32_t length) {
   }
 
   SCOPE_profile_cpu_f("gpu");
+  rex::perf::cpu_profile::OwnerScope profile(rex::perf::CounterId::kCpuSharedMemoryRequestUs);
 
   if (!EnsureHostGpuMemoryAllocated(start, length)) {
     return false;
@@ -1022,7 +1081,20 @@ bool SharedMemory::RequestRangeUntracked(uint32_t start, uint32_t length) {
   if (upload_ranges_.empty()) {
     return true;
   }
+  WidenUploadRanges();
 
+  rex::perf::cpu_profile::OwnerScope upload_profile(
+      rex::perf::CounterId::kCpuSharedMemoryUploadUs);
+  if (rex::perf::cpu_profile::owner_thread &&
+      rex::perf::cpu_profile::enabled.load(std::memory_order_relaxed)) {
+    for (const auto& range : upload_ranges_) {
+      rex::perf::cpu_profile::AddOwnerCount(rex::perf::CounterId::kCpuSharedMemoryUploadPages,
+                                            range.second);
+      for (uint32_t page = 0; page < range.second; ++page) {
+        rex::perf::cpu_profile::frame_uploaded_pages.push_back(range.first + page);
+      }
+    }
+  }
   return UploadRanges(upload_ranges_);
 }
 

@@ -20,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/thread/mutex.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
@@ -1200,7 +1201,13 @@ void CommandProcessor::CpuProfileOnFrameEnd() {
   if (!cpu_profile::enabled.load(std::memory_order_relaxed)) {
     // Newly armed - start accumulating from the next frame.
     cpu_profile::enabled.store(true, std::memory_order_relaxed);
+    cpu_profile::owner_thread = true;
     cpu_profile::Reset();
+#if REX_PLATFORM_PS5
+    rex::thread::global_lock_wait_ticks = 0;
+    rex::thread::global_lock_waits = 0;
+    rex::thread::global_lock_sleeps = 0;
+#endif
     cpu_profile_frames_ = 0;
     cpu_profile_window_start_ticks_ = now_ticks;
     cpu_profile_window_start_time_ = now_time;
@@ -1208,6 +1215,33 @@ void CommandProcessor::CpuProfileOnFrameEnd() {
                 kCpuProfileLogFrameInterval);
     return;
   }
+  // Upload shape this frame: distinct pages, how many contiguous runs they
+  // form, the longest run, and uploads repeated for a page within the frame.
+  struct UploadShape {
+    uint64_t distinct, runs, longest, repeats;
+  };
+  static UploadShape upload_shape{};
+  {
+    auto& pages = cpu_profile::frame_uploaded_pages;
+    std::sort(pages.begin(), pages.end());
+    const size_t total = pages.size();
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    uint64_t run = 0, longest = 0, runs = 0;
+    for (size_t i = 0; i < pages.size(); ++i) {
+      run = (i && pages[i] == pages[i - 1] + 1) ? run + 1 : 1;
+      runs += run == 1;
+      longest = std::max(longest, run);
+    }
+    upload_shape.distinct += pages.size();
+    upload_shape.runs += runs;
+    upload_shape.longest = std::max(upload_shape.longest, longest);
+    upload_shape.repeats += total - pages.size();
+    pages.clear();
+  }
+#if REX_PLATFORM_PS5
+  // Process-wide mprotect calls by site (see Ps5ProtectCallCount).
+  static uint64_t protect_sites_before[rex::memory::kPs5ProtectSiteCount]{};
+#endif
   if (++cpu_profile_frames_ < kCpuProfileLogFrameInterval) {
     return;
   }
@@ -1263,7 +1297,52 @@ void CommandProcessor::CpuProfileOnFrameEnd() {
         swap_us, guest_wait_us, pm4_us > accounted_us ? pm4_us - accounted_us : 0,
         avg_count(CounterId::kDrawSamplerFastPathDraws),
         avg_count(CounterId::kDrawTextureFastPathDraws));
+    uint64_t lock_wait_us = 0, lock_waits = 0, lock_sleeps = 0;
+#if REX_PLATFORM_PS5
+    lock_wait_us = uint64_t(double(rex::thread::global_lock_wait_ticks) * us_per_tick) / frames;
+    lock_waits = rex::thread::global_lock_waits / frames;
+    lock_sleeps = rex::thread::global_lock_sleeps / frames;
+#endif
+    std::string protect_sites;
+#if REX_PLATFORM_PS5
+    for (int site = 0; site < rex::memory::kPs5ProtectSiteCount; ++site) {
+      const uint64_t count = rex::memory::Ps5ProtectCallCount(site);
+      fmt::format_to(std::back_inserter(protect_sites), "{}{}", site ? "/" : "",
+                     (count - protect_sites_before[site]) / frames);
+      protect_sites_before[site] = count;
+    }
+#endif
+    REXGPU_INFO(
+        "CPU upload shape (avg/frame): pages={} runs={} longest_run={} repeated={} | "
+        "all-thread mprotect by site other/watch/trigger/guest/stale={}",
+        upload_shape.distinct / frames, upload_shape.runs / frames, upload_shape.longest,
+        upload_shape.repeats / frames, protect_sites);
+    upload_shape = {};
+    REXGPU_INFO(
+        "CPU profile detail (avg/frame): lock_wait={}us ({}x, {} slept) mprotect={}us ({}x) "
+        "shmem_request={}us ({}x) shmem_upload={}us ({}x, {} pages) shmem_make_valid={}us ({}x)",
+        lock_wait_us, lock_waits, lock_sleeps, avg_us(CounterId::kCpuMemoryProtectUs),
+        avg_count(CounterId::kCpuMemoryProtectUs), avg_us(CounterId::kCpuSharedMemoryRequestUs),
+        avg_count(CounterId::kCpuSharedMemoryRequestUs),
+        avg_us(CounterId::kCpuSharedMemoryUploadUs),
+        avg_count(CounterId::kCpuSharedMemoryUploadUs),
+        avg_count(CounterId::kCpuSharedMemoryUploadPages),
+        avg_us(CounterId::kCpuSharedMemoryMakeValidUs),
+        avg_count(CounterId::kCpuSharedMemoryMakeValidUs));
+    REXGPU_INFO(
+        "CPU texture detail (avg/frame): request={}us ({}x) shmem={}us commit={}us ({} loads, "
+        "{} KB) backend={}us",
+        avg_us(CounterId::kTextureRequestUs), avg_count(CounterId::kTextureRequestUs),
+        avg_us(CounterId::kTextureSharedMemoryRequestUs), avg_us(CounterId::kTextureCommitLoadUs),
+        avg_count(CounterId::kTextureCommitLoadUs),
+        avg_count(CounterId::kTextureLoadBytes) / 1024,
+        avg_us(CounterId::kTextureLoadBackendUs));
   }
+#if REX_PLATFORM_PS5
+  rex::thread::global_lock_wait_ticks = 0;
+  rex::thread::global_lock_waits = 0;
+  rex::thread::global_lock_sleeps = 0;
+#endif
   cpu_profile::Reset();
   cpu_profile_frames_ = 0;
   cpu_profile_window_start_ticks_ = now_ticks;

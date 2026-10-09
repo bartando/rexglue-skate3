@@ -24,6 +24,7 @@
 
 #include <rex/math.h>
 #include <rex/memory/utils.h>
+#include <rex/perf/counter.h>
 #include <rex/platform.h>
 #include <rex/string.h>
 
@@ -364,6 +365,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   const int site = Ps5ProtectSite();
   if (site >= 0 && site < kPs5ProtectSiteCount) protect_site_calls[site].fetch_add(1, std::memory_order_relaxed);
 #endif
+  perf::cpu_profile::OwnerScope profile(perf::CounterId::kCpuMemoryProtectUs);
   return mprotect(base_address, length, prot) == 0;
 }
 

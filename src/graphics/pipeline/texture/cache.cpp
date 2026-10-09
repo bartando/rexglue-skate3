@@ -497,6 +497,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   }
   PERF_counter_inc(kTextureLoadsCommitted);
   PERF_counter_add(kTextureLoadBytes, static_cast<int64_t>(load_bytes));
+  rex::perf::cpu_profile::AddOwnerCount(rex::perf::CounterId::kTextureLoadBytes, load_bytes);
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
   // resolves as well to detect when the CPU wants to reuse the memory for a

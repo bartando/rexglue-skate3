@@ -156,8 +156,8 @@ bool ReleaseFileMappingRange(FileMappingHandle handle, void* base_address, size_
 uint64_t Ps5ProtectCallCount();
 // The same, by who asked: 0 anything else, 1 enabling write-watches, 2 a watch
 // being triggered (a guest write fault or the GPU writing guest memory),
-// 3 reconciling host page protection with guest pages smaller than a host
-// page, 4 the access-violation callback's stale-protection recovery.
+// 3 the guest changing page protection (BaseHeap::Protect), 4 the
+// access-violation callback's stale-protection recovery.
 inline constexpr int kPs5ProtectSiteCount = 5;
 uint64_t Ps5ProtectCallCount(int site);
 // Set (through Ps5ProtectSiteScope) by the code about to call Protect(). A
