@@ -1433,6 +1433,12 @@ void XHostThread::Execute() {
   // Let the kernel know we are starting.
   kernel_state_->OnThreadExecute(this);
 
+  // Host threads also run guest callbacks (audio, XMA). Without this the guest
+  // FPSCR's VMX mode loads a zero MXCSR, unmasking every x86 FP exception.
+  if (thread_state_) {
+    thread_state_->context()->fpscr.InitHost();
+  }
+
   int ret = host_fn_();
 
   // Exit.
