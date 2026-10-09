@@ -12,9 +12,11 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -129,6 +131,7 @@ class VulkanPresenter final : public Presenter {
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+  bool CaptureFinalOutput(RawImage& image_out) override;
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -358,7 +361,7 @@ class VulkanPresenter final : public Presenter {
         const VulkanDevice* vulkan_device, VkSurfaceKHR surface, uint32_t width, uint32_t height,
         VkSwapchainKHR old_swapchain, uint32_t& present_queue_family_out,
         VkFormat& image_format_out, VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& ui_surface_unusable_out);
+        bool& transfer_src_out, bool& ui_surface_unusable_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -418,6 +421,8 @@ class VulkanPresenter final : public Presenter {
     uint32_t present_queue_family = UINT32_MAX;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D swapchain_extent = {};
+    // Created with transfer source usage (present_final_output_capture).
+    bool swapchain_transfer_src = false;
     bool swapchain_is_fifo = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
@@ -501,6 +506,12 @@ class VulkanPresenter final : public Presenter {
   // UI submission tracker with the submission index that can be given to UI
   // drawers (accessible from the UI thread only, at any time).
   VulkanSubmissionTracker ui_submission_tracker_;
+
+  // A CaptureFinalOutput waiting for the next paint to fill its image.
+  std::mutex final_capture_mutex_;
+  std::condition_variable final_capture_cv_;
+  RawImage* final_capture_target_ = nullptr;
+  bool final_capture_result_ = false;
 
   // Accessible only by painting and by surface connection lifetime management
   // (ConnectOrReconnectPaintingToSurfaceFromUIThread,

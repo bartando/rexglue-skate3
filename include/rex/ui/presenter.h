@@ -405,6 +405,12 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+  // The next presented frame, UI overlays included, for debugging. Blocks
+  // until a frame is painted; false if unsupported or nothing was painted.
+  virtual bool CaptureFinalOutput(RawImage& image_out) {
+    (void)image_out;
+    return false;
+  }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
