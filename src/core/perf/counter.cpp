@@ -314,6 +314,9 @@ constexpr const char* kCounterNames[] = {
     "cpu_shared_memory_upload_us",
     "cpu_shared_memory_upload_pages",
     "cpu_shared_memory_make_valid_us",
+    "cpu_shared_memory_hot_skipped_pages",
+    "cpu_shared_memory_hot_uploaded_pages",
+    "cpu_shared_memory_shadow_evictions",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -507,6 +510,9 @@ constexpr bool kIsGauge[] = {
     false,  // kCpuSharedMemoryUploadUs
     false,  // kCpuSharedMemoryUploadPages
     false,  // kCpuSharedMemoryMakeValidUs
+    false,  // kCpuSharedMemoryHotSkippedPages
+    false,  // kCpuSharedMemoryHotUploadedPages
+    false,  // kCpuSharedMemoryShadowEvictions
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

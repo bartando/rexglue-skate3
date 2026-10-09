@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -128,6 +129,8 @@ class SharedMemory {
   uint32_t firing_address_last() const { return firing_address_last_; }
   const uint8_t* TranslatePhysical(uint32_t address) const;
   void ResetGpuAccessWindow();
+  // Advances the frame index that hot-page detection counts streaks in.
+  void OnFrameEnd() { frame_index_.fetch_add(1, std::memory_order_relaxed); }
 
  protected:
   // Whether moving an upload ahead of earlier work in the window could change
@@ -142,6 +145,11 @@ class SharedMemory {
   // copy would land before them.
   void NoteUploadedPages(const std::vector<std::pair<uint32_t, const uint8_t*>>& pages,
                          bool hoisted);
+
+  // The buffer is guest memory itself (VulkanSharedMemory zero copy): nothing
+  // is uploaded, requests are no-ops, and only watches protect pages.
+  bool zero_copy_ = false;
+  void set_cpu_invalidation_widen_pages(uint32_t pages) { cpu_invalidation_widen_pages_ = pages; }
 
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
@@ -228,11 +236,56 @@ class SharedMemory {
   bool window_inline_uploaded_any_ = false;
   void NotePartialPageAccess(uint32_t page, uint32_t offset_first, uint32_t offset_end);
   // CPU copy of what the last upload of each page put in the buffer, valid
-  // until the GPU writes the page. Reserved lazily for the whole buffer; only
-  // uploaded pages get backed.
-  uint8_t* upload_shadow_ = nullptr;
-  bool upload_shadow_unavailable_ = false;
+  // until the GPU writes the page. Allocated in 64-page chunks on first upload:
+  // a single 512 MB reservation fails in a PS5 title's memory budget. Capped
+  // by shared_memory_upload_shadow_max_mb; past the cap the least recently
+  // used chunk is freed. Losing a page's shadow only makes uploads to it
+  // non-hoistable and hot-page checks upload instead of compare.
+  std::vector<std::unique_ptr<uint8_t[]>> upload_shadow_chunks_;
+  std::vector<uint32_t> upload_shadow_chunk_used_frame_;
+  size_t upload_shadow_chunk_count_ = 0;
+  size_t upload_shadow_max_chunks_ = SIZE_MAX;
   std::vector<uint64_t> upload_shadow_valid_;
+  // The shadow of a page, or nullptr if its chunk is not allocated.
+  const uint8_t* UploadShadowPage(uint32_t page) const;
+  uint8_t* AllocateUploadShadowPage(uint32_t page);
+  void NoteUploadShadowUse(uint32_t page) {
+    upload_shadow_chunk_used_frame_[page >> 6] = frame_index_.load(std::memory_order_relaxed);
+  }
+  void EvictUploadShadowChunk(size_t keep_chunk);
+  size_t upload_shadow_chunk_bytes() const { return size_t(64) << page_size_log2_; }
+
+  // Hot pages (shared_memory_hot_pages). A page the CPU write-faults on in
+  // kHotPageStreak consecutive frames stops being write-protected and is never
+  // marked valid. Requests compare the bytes they need against the upload
+  // shadow instead, and upload the page only if they differ. This removes the
+  // fault, unprotect, upload and re-protect cycle for data rewritten every
+  // frame, which costs ~33 us per protection change on the PS5.
+  //
+  // A watch registered over a hot page demotes it: the page is protected again
+  // and checked against the shadow before the next request, firing watches if
+  // it changed. GPU writes demote it too, since the shadow no longer matches.
+  static constexpr uint8_t kHotPageStreak = 4;
+  bool hot_pages_enabled_ = false;
+  std::atomic<uint32_t> frame_index_{1};
+  std::vector<uint64_t> hot_pages_;
+  // Pages a watch demoted. They never become hot again: textures reloaded
+  // every frame would otherwise demote and re-promote them in a loop, paying a
+  // protection change each time.
+  std::vector<uint64_t> hot_excluded_pages_;
+  std::vector<uint32_t> cpu_invalidation_frame_;
+  std::vector<uint8_t> cpu_invalidation_streak_;
+  std::vector<uint32_t> pending_demotion_checks_;
+  std::vector<std::pair<uint32_t, uint32_t>> hot_filtered_ranges_;
+  void NoteCpuInvalidation(uint32_t page_first, uint32_t page_last);
+  void DemoteHotPages(uint32_t page_first, uint32_t page_last);
+  void CheckDemotedPages();
+  // Drops hot pages from upload_ranges_ whose requested bytes match the
+  // upload shadow. requested are byte ranges.
+  void FilterUnchangedHotPages(const std::pair<uint32_t, uint32_t>* requested, size_t count);
+  bool IsHotPage(uint32_t page) const {
+    return hot_pages_enabled_ && ((hot_pages_[page >> 6] >> (page & 63)) & 1);
+  }
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;

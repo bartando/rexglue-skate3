@@ -14,6 +14,8 @@
 #include <rex/graphics/register_file.h>
 #include <rex/math.h>
 
+#include <vector>
+
 namespace rex::graphics {
 
 RegisterFile::RegisterFile() {
@@ -35,6 +37,17 @@ const RegisterInfo* RegisterFile::GetRegisterInfo(uint32_t index) {
     default:
       return nullptr;
   }
+}
+
+bool RegisterFile::IsKnownRegister(uint32_t index) {
+  static const std::vector<bool> known = [] {
+    std::vector<bool> table(kRegisterCount);
+    for (uint32_t i = 0; i < kRegisterCount; ++i) {
+      table[i] = GetRegisterInfo(i) != nullptr;
+    }
+    return table;
+  }();
+  return index < kRegisterCount && known[index];
 }
 
 }  // namespace rex::graphics

@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -21,6 +23,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/memory/utils.h>
 #include <rex/ui/vulkan/util.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
@@ -31,6 +34,12 @@ REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
                     "Record shared memory uploads no earlier work in the submission "
                     "depends on at the start of the submission, instead of ending the "
                     "current render pass for them.");
+
+REXCVAR_DEFINE_BOOL(vulkan_zero_copy_shared_memory, false, "GPU/Vulkan",
+                    "Use guest physical memory itself as the shared memory buffer (unified "
+                    "memory hosts with VK_EXT_external_memory_host): no uploads and no "
+                    "write-watching for buffers")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
 
@@ -67,7 +76,14 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) &&
+  if (REXCVAR_GET(vulkan_zero_copy_shared_memory) && InitializeZeroCopyBuffer()) {
+    zero_copy_ = true;
+    // Widening a write fault only batches uploads; with nothing to upload it
+    // would just fire the watches of every texture near dynamic data.
+    set_cpu_invalidation_widen_pages(1);
+  }
+
+  if (!zero_copy_ && REXCVAR_GET(vulkan_sparse_shared_memory) &&
       vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
@@ -233,6 +249,84 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
   }
   last_written_range_ = written_range;
+}
+
+bool VulkanSharedMemory::InitializeZeroCopyBuffer() {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  if (!vulkan_device->extensions().ext_EXT_external_memory_host) {
+    REXGPU_WARN("Shared memory: zero copy needs VK_EXT_external_memory_host; copying instead");
+    return false;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  void* const host = memory().TranslatePhysical(0);
+#if REX_PLATFORM_PS5
+  if (!rex::memory::Ps5GrantGpuAccess(host, kBufferSize)) {
+    REXGPU_WARN("Shared memory: could not give the GPU access to guest memory; copying instead");
+    return false;
+  }
+#endif
+  VkMemoryHostPointerPropertiesEXT host_properties = {};
+  host_properties.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT;
+  if (dfn.vkGetMemoryHostPointerPropertiesEXT(
+          device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host,
+          &host_properties) != VK_SUCCESS) {
+    REXGPU_WARN("Shared memory: guest memory at {} can't be imported; copying instead",
+                fmt::ptr(host));
+    return false;
+  }
+
+  VkExternalMemoryBufferCreateInfo external_info = {};
+  external_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+  external_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  VkBufferCreateInfo buffer_info = {};
+  buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  buffer_info.pNext = &external_info;
+  buffer_info.size = kBufferSize;
+  buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+  buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VkBuffer buffer;
+  if (dfn.vkCreateBuffer(device, &buffer_info, nullptr, &buffer) != VK_SUCCESS) {
+    REXGPU_WARN("Shared memory: could not create the zero-copy buffer; copying instead");
+    return false;
+  }
+  VkMemoryRequirements requirements;
+  dfn.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+  uint32_t memory_type;
+  if (!rex::bit_scan_forward(requirements.memoryTypeBits & host_properties.memoryTypeBits,
+                             &memory_type)) {
+    REXGPU_WARN("Shared memory: no memory type can import guest memory; copying instead");
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    return false;
+  }
+  VkImportMemoryHostPointerInfoEXT import_info = {};
+  import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+  import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+  import_info.pHostPointer = host;
+  VkMemoryAllocateInfo allocate_info = {};
+  allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  allocate_info.pNext = &import_info;
+  allocate_info.allocationSize = kBufferSize;
+  allocate_info.memoryTypeIndex = memory_type;
+  VkDeviceMemory memory;
+  if (dfn.vkAllocateMemory(device, &allocate_info, nullptr, &memory) != VK_SUCCESS) {
+    REXGPU_WARN("Shared memory: importing guest memory failed; copying instead");
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    return false;
+  }
+  if (dfn.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+    REXGPU_WARN("Shared memory: binding imported guest memory failed; copying instead");
+    dfn.vkFreeMemory(device, memory, nullptr);
+    dfn.vkDestroyBuffer(device, buffer, nullptr);
+    return false;
+  }
+  buffer_ = buffer;
+  buffer_memory_type_ = memory_type;
+  buffer_memory_.push_back(memory);
+  REXGPU_INFO("Shared memory: the GPU uses guest memory at {} directly (zero copy)",
+              fmt::ptr(host));
+  return true;
 }
 
 bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {

@@ -36,6 +36,9 @@ class RegisterFile {
   RegisterFile();
 
   static const RegisterInfo* GetRegisterInfo(uint32_t index);
+  // GetRegisterInfo(index) != nullptr through a table instead of the large
+  // switch, for per-write checks on the command processor's hot path.
+  static bool IsKnownRegister(uint32_t index);
 
   static constexpr size_t kRegisterCount = 0x5003;
   uint32_t values[kRegisterCount];

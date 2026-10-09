@@ -20,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
+#include <rex/perf/sampler.h>
 #include <rex/thread/mutex.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
@@ -124,6 +125,11 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, !REX_PLATFORM_MAC, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 #ifdef REXGLUE_ENABLE_PERF_COUNTERS
+REXCVAR_DEFINE_INT32(gpu_cpu_sample_hz, 0, "GPU",
+                     "With gpu_cpu_profile, sample the GPU emulation thread's instruction "
+                     "pointer this many times per second (PS5 only); 0 disables it");
+REXCVAR_DEFINE_STRING(gpu_cpu_sample_file, "", "GPU",
+                      "File the GPU thread CPU samples are written to");
 REXCVAR_DEFINE_BOOL(gpu_cpu_profile, false, "GPU",
                     "Log per-frame CPU time attribution for the GPU emulation thread "
                     "(packet processing, draw stages, submission) every 120 frames")
@@ -503,7 +509,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  if (!RegisterFile::IsKnownRegister(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -1202,6 +1208,8 @@ void CommandProcessor::CpuProfileOnFrameEnd() {
     // Newly armed - start accumulating from the next frame.
     cpu_profile::enabled.store(true, std::memory_order_relaxed);
     cpu_profile::owner_thread = true;
+    rex::perf::sampler::StartForCurrentThread(uint32_t(std::max(REXCVAR_GET(gpu_cpu_sample_hz), 0)),
+                                              REXCVAR_GET(gpu_cpu_sample_file));
     cpu_profile::Reset();
 #if REX_PLATFORM_PS5
     rex::thread::global_lock_wait_ticks = 0;
@@ -1314,9 +1322,15 @@ void CommandProcessor::CpuProfileOnFrameEnd() {
 #endif
     REXGPU_INFO(
         "CPU upload shape (avg/frame): pages={} runs={} longest_run={} repeated={} | "
+        "hot pages skipped={} uploaded={} | shadow={}MB cap={}MB evicted={} chunks/window | "
         "all-thread mprotect by site other/watch/trigger/guest/stale={}",
         upload_shape.distinct / frames, upload_shape.runs / frames, upload_shape.longest,
-        upload_shape.repeats / frames, protect_sites);
+        upload_shape.repeats / frames, avg_count(CounterId::kCpuSharedMemoryHotSkippedPages),
+        avg_count(CounterId::kCpuSharedMemoryHotUploadedPages),
+        cpu_profile::upload_shadow_bytes.load(std::memory_order_relaxed) >> 20,
+        cpu_profile::upload_shadow_cap_bytes.load(std::memory_order_relaxed) >> 20,
+        cpu_profile::slots[size_t(CounterId::kCpuSharedMemoryShadowEvictions)].count,
+        protect_sites);
     upload_shape = {};
     REXGPU_INFO(
         "CPU profile detail (avg/frame): lock_wait={}us ({}x, {} slept) mprotect={}us ({}x) "
@@ -1343,6 +1357,7 @@ void CommandProcessor::CpuProfileOnFrameEnd() {
   rex::thread::global_lock_waits = 0;
   rex::thread::global_lock_sleeps = 0;
 #endif
+  rex::perf::sampler::Flush();
   cpu_profile::Reset();
   cpu_profile_frames_ = 0;
   cpu_profile_window_start_ticks_ = now_ticks;

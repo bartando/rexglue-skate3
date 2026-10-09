@@ -367,6 +367,9 @@ enum class CounterId : uint16_t {
   kCpuSharedMemoryUploadUs,
   kCpuSharedMemoryUploadPages,
   kCpuSharedMemoryMakeValidUs,
+  kCpuSharedMemoryHotSkippedPages,
+  kCpuSharedMemoryHotUploadedPages,
+  kCpuSharedMemoryShadowEvictions,
 
   kCount  // sentinel -- must be last
 };
@@ -425,6 +428,10 @@ class OwnerScope {
   CounterId id_;
   uint64_t start_;
 };
+
+// Upload shadow memory in use and its cap (0 = none), for the profile log.
+inline std::atomic<uint64_t> upload_shadow_bytes{0};
+inline std::atomic<uint64_t> upload_shadow_cap_bytes{0};
 
 // Shared-memory pages uploaded this frame (owner thread, profile armed),
 // consumed at frame end to measure how contiguous and repeated uploads are.

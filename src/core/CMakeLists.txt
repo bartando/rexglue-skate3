@@ -15,6 +15,7 @@ add_library(rexcore OBJECT
     logging.cpp
     perf/hitch_diagnostics.cpp
     perf/thread_cpu.cpp
+    perf/sampler.cpp
     memory.cpp
     mutex.cpp
     ring_buffer.cpp

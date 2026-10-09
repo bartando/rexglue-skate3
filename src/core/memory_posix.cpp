@@ -60,11 +60,27 @@ constexpr size_t kDirectAlignment = 0x200000;
 int64_t direct_start = -1;
 size_t direct_length = 0;
 std::atomic<uint64_t> protect_calls{0};
+// Range the GPU reads guest memory through (Ps5GrantGpuAccess). Protection
+// changes inside it keep GPU access: a plain mprotect would drop it.
+std::atomic<uintptr_t> gpu_range_first{0};
+std::atomic<uintptr_t> gpu_range_end{0};
+constexpr int kGpuReadWrite = 0x10 | 0x20;  // PS5_KERNEL_PROT_GPU_READ | _WRITE
 std::atomic<uint64_t> protect_site_calls[kPs5ProtectSiteCount]{};
 }
 #endif
 
 namespace {
+
+int HostProtect(void* base_address, size_t length, int prot) {
+#if REX_PLATFORM_PS5
+  const uintptr_t first = reinterpret_cast<uintptr_t>(base_address);
+  if (first < gpu_range_end.load(std::memory_order_relaxed) &&
+      first + length > gpu_range_first.load(std::memory_order_relaxed)) {
+    return sceKernelMprotect(base_address, length, prot | kGpuReadWrite);
+  }
+#endif
+  return mprotect(base_address, length, prot);
+}
 
 #if REX_PLATFORM_MAC || REX_PLATFORM_PS5
 void AlignHostPageRange(void*& base_address, size_t& length) {
@@ -268,7 +284,7 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
     void* protect_base = base_address;
     size_t protect_length = length;
     AlignHostPageRange(protect_base, protect_length);
-    if (mprotect(protect_base, protect_length, static_cast<int>(prot_requested)) == 0) {
+    if (HostProtect(protect_base, protect_length, static_cast<int>(prot_requested)) == 0) {
       return base_address;
     }
 #if REX_PLATFORM_PS5
@@ -319,7 +335,7 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
 #if REX_PLATFORM_MAC || REX_PLATFORM_PS5
       AlignHostPageRange(base_address, length);
 #endif
-      if (mprotect(base_address, length, PROT_NONE) != 0) {
+      if (HostProtect(base_address, length, PROT_NONE) != 0) {
         return false;
       }
 #if defined(MADV_DONTNEED)
@@ -366,7 +382,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   if (site >= 0 && site < kPs5ProtectSiteCount) protect_site_calls[site].fetch_add(1, std::memory_order_relaxed);
 #endif
   perf::cpu_profile::OwnerScope profile(perf::CounterId::kCpuMemoryProtectUs);
-  return mprotect(base_address, length, prot) == 0;
+  return HostProtect(base_address, length, int(prot)) == 0;
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
@@ -557,6 +573,15 @@ bool ReleaseFileMappingRange(FileMappingHandle handle, void* address, size_t len
   return handle == kDirectMemoryHandle && sceKernelMunmap(address, length) == 0;
 }
 int& Ps5ProtectSite() { static thread_local int site = 0; return site; }
+bool Ps5GrantGpuAccess(void* base_address, size_t length) {
+  if (sceKernelMprotect(base_address, length, PROT_READ | PROT_WRITE | kGpuReadWrite) != 0) {
+    return false;
+  }
+  gpu_range_first.store(reinterpret_cast<uintptr_t>(base_address), std::memory_order_relaxed);
+  gpu_range_end.store(reinterpret_cast<uintptr_t>(base_address) + length,
+                      std::memory_order_relaxed);
+  return true;
+}
 uint64_t Ps5ProtectCallCount() { return protect_calls.load(std::memory_order_relaxed); }
 uint64_t Ps5ProtectCallCount(int site) {
   return site >= 0 && site < kPs5ProtectSiteCount ? protect_site_calls[site].load(std::memory_order_relaxed) : 0;

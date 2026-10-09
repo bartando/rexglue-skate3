@@ -61,6 +61,14 @@ class VulkanSharedMemory : public SharedMemory {
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 
  private:
+  // Imports guest physical memory as the buffer's memory, so the GPU reads
+  // and writes guest memory directly instead of a copy. Needs a host where the
+  // GPU shares system memory and VK_EXT_external_memory_host.
+  bool InitializeZeroCopyBuffer();
+
+ protected:
+
+ private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
                      VkAccessFlags& access_mask) const;
 

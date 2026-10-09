@@ -226,6 +226,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance1, 1, 1)
     // #81. Used for guest draw constant buffer descriptors.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_push_descriptor)
+    // #179. Shared memory can be guest memory itself on unified-memory hosts.
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_external_memory_host)
     // #141.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
     // #148.
@@ -823,6 +825,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_push_descriptor) {
 #include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
+  }
+  if (device->extensions_.ext_EXT_external_memory_host) {
+#include <rex/ui/vulkan/functions/device_ext_external_memory_host.inc>
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

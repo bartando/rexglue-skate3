@@ -2834,6 +2834,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   rex::perf::hitch::RecordSwap();
+  if (shared_memory_) {
+    shared_memory_->OnFrameEnd();
+  }
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 

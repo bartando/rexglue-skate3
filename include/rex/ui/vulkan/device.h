@@ -196,6 +196,7 @@ class VulkanDevice {
     bool ext_1_1_KHR_bind_memory2 = false;              // #158
     bool ext_1_2_KHR_spirv_1_4 = false;                 // #237
     bool ext_EXT_memory_budget = false;                 // #238
+    bool ext_EXT_external_memory_host = false;          // #179
     // Has optional features not implied by this being true.
     bool ext_EXT_custom_border_color = false;
     // Has optional features not implied by this being true.
@@ -219,6 +220,8 @@ class VulkanDevice {
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
     // VK_KHR_push_descriptor (#81)
 #include <rex/ui/vulkan/functions/device_khr_push_descriptor.inc>
+    // VK_EXT_external_memory_host (#179)
+#include <rex/ui/vulkan/functions/device_ext_external_memory_host.inc>
     // VK_KHR_get_memory_requirements2 (#147, promoted to 1.1)
 #include <rex/ui/vulkan/functions/device_1_1_khr_get_memory_requirements2.inc>
     // VK_KHR_bind_memory2 (#158, promoted to 1.1)

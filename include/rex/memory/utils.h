@@ -152,6 +152,9 @@ bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length);
 // an installed title). Returns nullptr on failure.
 void* ReserveFileMappingRange(FileMappingHandle handle, size_t length);
 bool ReleaseFileMappingRange(FileMappingHandle handle, void* base_address, size_t length);
+// Gives the GPU read/write access to host memory (all of it CPU read/write)
+// and keeps that access through later protection changes in the range.
+bool Ps5GrantGpuAccess(void* base_address, size_t length);
 // Number of Protect() calls made so far, for performance diagnosis.
 uint64_t Ps5ProtectCallCount();
 // The same, by who asked: 0 anything else, 1 enabling write-watches, 2 a watch
